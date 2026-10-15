@@ -160,6 +160,19 @@ async def admin_cb(update: Update, ctx):
         await q.edit_message_text("📢 متن پیام همگانی را ارسال کنید:")
         return BROADCAST
 
+    elif data == "adm_backup":
+        if os.path.exists(db.db_name):
+            await update.message.reply_text("⏳ در حال آماده‌سازی فایل دیتابیس...")
+            await ctx.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=open(db.db_name, "rb"),
+                filename="bot_database_backup.db",
+                caption="💾 *فایل بکاپ دیتابیس ربات*\nشامل کلیه کاتالوگ‌ها، کاربران و تنظیمات."
+            )
+        else:
+          
+        await update.message.reply_text("⚠️ فایل دیتابیس یافت نشد.")
+        
 async def upload_cat_select(update: Update, ctx):
     q = update.callback_query; await q.answer()
     cat_key = q.data.replace("cat_", "")
