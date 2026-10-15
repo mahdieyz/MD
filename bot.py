@@ -18,7 +18,7 @@ UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, BROADCAST = range(5)
 def is_admin(uid):
     return uid in ADMIN_IDS
 
-# ── KEYBOARDS (Matching Screenshot Exactly) ──
+# ── KEYBOARDS ──
 
 def main_menu_kb():
     keyboard = [
@@ -60,7 +60,7 @@ async def handle_message(update: Update, ctx):
     chat_id = update.effective_chat.id
 
     # 1. Main Navigation / Categories
-    if text == "بازگشت به منوی اصلی" or text == "منوی اصلی":
+    if text in ("بازگشت به منوی اصلی", "منوی اصلی"):
         await update.message.reply_text("به منوی اصلی بازگشتید 👇", reply_markup=main_menu_kb())
 
     elif text == "نمای ساختمان - محوطه - استخری":
@@ -75,7 +75,6 @@ async def handle_message(update: Update, ctx):
 
     # 2. Product Items (Sends PDFs from Database)
     else:
-        # Category Keys Mapping
         category_map = {
             "مد نور": "mod_noor",
             "مگنتار و چراغ لاینی": "magnetar_line",
@@ -105,7 +104,6 @@ async def handle_message(update: Update, ctx):
             await update.message.reply_text(f"⏳ در حال ارسال کاتالوگ و لیست قیمت {text}...")
 
             for item in files:
-                # Send Document/PDF
                 if item["file_id"]:
                     try:
                         await ctx.bot.send_document(
@@ -118,24 +116,23 @@ async def handle_message(update: Update, ctx):
 
             await update.message.reply_text("✅ تمام فایل‌ها ارسال شدند.", reply_markup=back_only_kb())
 
-
-# ── ADMIN PANEL FOR MANAGING PDFs ──
+# ── ADMIN PANEL ──
 
 async def admin_cmd(update: Update, ctx):
     if not is_admin(update.effective_user.id):
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 آپلود PDF / کاتالوگ جدید", callback_data="adm_upload")],
-        [InlineKeyboardButton("🗑️ مدیریت / حذف کاتالوگ‌ها", callback_data="adm_manage")],
         [InlineKeyboardButton("📞 تنظیم اطلاعات تماس", callback_data="adm_contact")],
-        [InlineKeyboardButton("💾 دانلود فایل بکاپ (Database)", callback_data="adm_backup")], # ← NEW BUTTON
+        [InlineKeyboardButton("💾 دانلود دیتابیس (Backup)", callback_data="adm_backup")],
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="adm_broadcast")],
         [InlineKeyboardButton("📊 آمار کاربران", callback_data="adm_stats")]
     ])
     await update.message.reply_text("🔧 *پنل مدیریت کاتالوگ‌ها*\nگزینه مورد نظر را انتخاب کنید:", parse_mode="Markdown", reply_markup=kb)
 
 async def admin_cb(update: Update, ctx):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     data = q.data
 
     if data == "adm_stats":
@@ -152,6 +149,22 @@ async def admin_cb(update: Update, ctx):
         await q.edit_message_text("📂 دسته‌ای که می‌خواهید PDF به آن اضافه شود را انتخاب کنید:", reply_markup=kb)
         return UPLOAD_CAT
 
+    elif data == "adm_backup":
+        if os.path.exists(db.db_name):
+            await q.edit_message_text("⏳ در حال ارسال فایل دیتابیس...")
+            try:
+                with open(db.db_name, "rb") as doc:
+                    await ctx.bot.send_document(
+                        chat_id=q.message.chat_id,
+                        document=doc,
+                        filename="bot_database_backup.db",
+                        caption="💾 *فایل بکاپ دیتابیس ربات*\nشامل کلیه کاتالوگ‌ها، کاربران و تنظیمات."
+                    )
+            except Exception as e:
+                logging.error(f"Backup Error: {e}")
+        else:
+            await q.edit_message_text("⚠️ فایل دیتابیس یافت نشد.")
+
     elif data == "adm_contact":
         await q.edit_message_text("📝 متن جدید بخش تماس با ما / ثبت سفارش را ارسال کنید:")
         return SET_CONTACT
@@ -160,24 +173,12 @@ async def admin_cb(update: Update, ctx):
         await q.edit_message_text("📢 متن پیام همگانی را ارسال کنید:")
         return BROADCAST
 
-    elif data == "adm_backup":
-        if os.path.exists(db.db_name):
-            await update.message.reply_text("⏳ در حال آماده‌سازی فایل دیتابیس...")
-            await ctx.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=open(db.db_name, "rb"),
-                filename="bot_database_backup.db",
-                caption="💾 *فایل بکاپ دیتابیس ربات*\nشامل کلیه کاتالوگ‌ها، کاربران و تنظیمات."
-            )
-        else:
-          
-        await update.message.reply_text("⚠️ فایل دیتابیس یافت نشد.")
-        
 async def upload_cat_select(update: Update, ctx):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     cat_key = q.data.replace("cat_", "")
     ctx.user_data["upload_cat_key"] = cat_key
-    await q.edit_message_text(f"📄 حالا فایل PDF یا کاتالوگ مربوطه را ارسال کنید:")
+    await q.edit_message_text("📄 حالا فایل PDF یا کاتالوگ مربوطه را ارسال کنید:")
     return UPLOAD_FILE
 
 async def upload_file_receive(update: Update, ctx):
@@ -192,7 +193,7 @@ async def upload_file_receive(update: Update, ctx):
         )
         return UPLOAD_NOTE
     else:
-        await update.message.reply_text("⚠️ لطفاً فایل را به صورت Document (PDF یا تصویر) ارسال کنید:")
+        await update.message.reply_text("⚠️ لطفاً فایل را به صورت Document ارسال کنید:")
         return UPLOAD_FILE
 
 async def upload_note_receive(update: Update, ctx):
