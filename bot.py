@@ -128,6 +128,7 @@ async def admin_cmd(update: Update, ctx):
         [InlineKeyboardButton("📤 آپلود PDF / کاتالوگ جدید", callback_data="adm_upload")],
         [InlineKeyboardButton("🗑️ مدیریت / حذف کاتالوگ‌ها", callback_data="adm_manage")],
         [InlineKeyboardButton("📞 تنظیم اطلاعات تماس", callback_data="adm_contact")],
+        [InlineKeyboardButton("💾 دانلود فایل بکاپ (Database)", callback_data="adm_backup")], # ← NEW BUTTON
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="adm_broadcast")],
         [InlineKeyboardButton("📊 آمار کاربران", callback_data="adm_stats")]
     ])
