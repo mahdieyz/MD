@@ -13,7 +13,7 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",")]
 
 # Admin Conversation States
-UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, BROADCAST = range(5)
+UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, BROADCAST, RESTORE_DB = range(6)
 
 def is_admin(uid):
     return uid in ADMIN_IDS
@@ -59,7 +59,6 @@ async def handle_message(update: Update, ctx):
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    # 1. Main Navigation / Categories
     if text in ("بازگشت به منوی اصلی", "منوی اصلی"):
         await update.message.reply_text("به منوی اصلی بازگشتید 👇", reply_markup=main_menu_kb())
 
@@ -73,7 +72,6 @@ async def handle_message(update: Update, ctx):
         contact = db.get_setting("contact_text", "📞 *ارتباط با واحد فروش توان سازه*\n\n📲 تلفن: 021-12345678\n👤 پشتیبانی تلگرام: @Tavansazeh_Admin")
         await update.message.reply_text(contact, parse_mode="Markdown", reply_markup=main_menu_kb())
 
-    # 2. Product Items (Sends PDFs from Database)
     else:
         category_map = {
             "مد نور": "mod_noor",
@@ -125,6 +123,7 @@ async def admin_cmd(update: Update, ctx):
         [InlineKeyboardButton("📤 آپلود PDF / کاتالوگ جدید", callback_data="adm_upload")],
         [InlineKeyboardButton("📞 تنظیم اطلاعات تماس", callback_data="adm_contact")],
         [InlineKeyboardButton("💾 دانلود دیتابیس (Backup)", callback_data="adm_backup")],
+        [InlineKeyboardButton("📥 آپلود و بازگردانی دیتابیس (Restore)", callback_data="adm_restore")],
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="adm_broadcast")],
         [InlineKeyboardButton("📊 آمار کاربران", callback_data="adm_stats")]
     ])
@@ -164,6 +163,10 @@ async def admin_cb(update: Update, ctx):
                 logging.error(f"Backup Error: {e}")
         else:
             await q.edit_message_text("⚠️ فایل دیتابیس یافت نشد.")
+
+    elif data == "adm_restore":
+        await q.edit_message_text("📥 لطفاً فایل دیتابیس جدید با پسوند `.db` را ارسال کنید:\n\n⚠️ *توجه:* دیتابیس فعلی جایگزین خواهد شد.", parse_mode="Markdown")
+        return RESTORE_DB
 
     elif data == "adm_contact":
         await q.edit_message_text("📝 متن جدید بخش تماس با ما / ثبت سفارش را ارسال کنید:")
@@ -210,6 +213,28 @@ async def upload_note_receive(update: Update, ctx):
     await update.message.reply_text("✅ فایل با موفقیت ذخیره شد و به دکمه مربوطه متصل گردید!", reply_markup=main_menu_kb())
     return ConversationHandler.END
 
+async def restore_db_receive(update: Update, ctx):
+    if update.message.document:
+        doc = update.message.document
+        if doc.file_name and (doc.file_name.endswith(".db") or doc.file_name.endswith(".sqlite")):
+            await update.message.reply_text("⏳ در حال دانلود و بازگردانی دیتابیس...")
+            
+            # Download file directly to local db path
+            file_obj = await ctx.bot.get_file(doc.file_id)
+            await file_obj.download_to_drive(custom_path=db.db_name)
+            
+            # Re-initialize DB connections
+            db.init_db()
+
+            await update.message.reply_text("✅ دیتابیس با موفقیت بازگردانی شد!", reply_markup=main_menu_kb())
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text("⚠️ پسوند فایل باید `.db` باشد. لطفاً فایل صحیح را بفرستید:")
+            return RESTORE_DB
+    else:
+        await update.message.reply_text("⚠️ لطفاً فایل دیتابیس را به عنوان فایل (Document) ارسال کنید:")
+        return RESTORE_DB
+
 async def set_contact_receive(update: Update, ctx):
     db.set_setting("contact_text", update.message.text)
     await update.message.reply_text("✅ اطلاعات تماس بروزرسانی شد.", reply_markup=main_menu_kb())
@@ -247,6 +272,7 @@ def main():
             UPLOAD_CAT: [CallbackQueryHandler(upload_cat_select, pattern="^cat_")],
             UPLOAD_FILE: [MessageHandler(filters.Document.ALL | filters.PHOTO, upload_file_receive)],
             UPLOAD_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, upload_note_receive)],
+            RESTORE_DB: [MessageHandler(filters.Document.ALL, restore_db_receive)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
             BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive)],
         },
