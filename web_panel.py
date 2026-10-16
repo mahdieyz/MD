@@ -3,7 +3,7 @@ import time
 import secrets
 import functools
 import requests
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session, send_file, abort
+from flask import Flask, render_template_string, request, redirect, url_for, flash, session, send_file
 from database import Database
 
 db = Database()
@@ -13,9 +13,7 @@ app.secret_key = os.environ.get('FLASK_SECRET', secrets.token_hex(32))
 
 PANEL_USERNAME = os.environ.get('PANEL_USERNAME', 'admin')
 PANEL_PASSWORD = os.environ.get('PANEL_PASSWORD', 'admin123')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
-# Category mapping
 MAIN_CATEGORIES = [
     "مگنتار و چراغ لاینی",
     "کلید ، پریز هوشمند و مکانیکی",
@@ -40,207 +38,97 @@ for cat in MAIN_CATEGORIES:
     else:
         ALL_CATEGORIES.append(cat)
 
-
-def login_required(f):
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get('logged_in'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def render_page(title, content_html, active_tab='dashboard'):
-    full_html = f"""
+LAYOUT = """
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title} | پنل مدیریت توان‌سازه</title>
+    <title>{{ page_title }} | پنل مدیریت توان‌سازه</title>
     <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: 'Segoe UI', Tahoma, system-ui, -apple-system, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
-            min-height: 100vh;
-        }}
-        .navbar {{
-            background: #1e293b;
-            padding: 1rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            border-bottom: 1px solid #334155;
-        }}
-        .navbar h1 {{ font-size: 1.25rem; color: #38bdf8; font-weight: 700; }}
-        .navbar .nav-links {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
-        .navbar a {{
-            color: #94a3b8;
-            text-decoration: none;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            font-size: 0.9rem;
-            font-weight: 500;
-            transition: all 0.2s;
-        }}
-        .navbar a:hover, .navbar a.active {{ color: #38bdf8; background: #334155; }}
-        .navbar a.logout {{ color: #f87171; }}
-        .navbar a.logout:hover {{ background: #450a0a; }}
-        .container {{ max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; }}
-        .card {{
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            border: 1px solid #334155;
-            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.2);
-        }}
-        .card h2 {{ color: #38bdf8; margin-bottom: 1.2rem; font-size: 1.15rem; font-weight: 600; }}
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-        }}
-        .stat-card {{
-            background: linear-gradient(135deg, #1e3a5f, #1e293b);
-            border-radius: 10px;
-            padding: 1.5rem;
-            text-align: center;
-            border: 1px solid #2d4a6f;
-        }}
-        .stat-card .number {{ font-size: 2.2rem; font-weight: 700; color: #38bdf8; }}
-        .stat-card .label {{ color: #94a3b8; margin-top: 0.4rem; font-size: 0.88rem; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }}
-        th, td {{ padding: 0.8rem 1rem; text-align: right; border-bottom: 1px solid #334155; }}
-        th {{ background: #334155; color: #38bdf8; font-weight: 600; }}
-        tr:hover {{ background: #253347; }}
-        .btn {{
-            display: inline-block;
-            padding: 0.6rem 1.2rem;
-            border-radius: 8px;
-            border: none;
-            cursor: pointer;
-            font-size: 0.88rem;
-            font-weight: 600;
-            text-decoration: none;
-            transition: all 0.2s;
-            font-family: inherit;
-        }}
-        .btn-primary {{ background: #0284c7; color: white; }}
-        .btn-primary:hover {{ background: #0369a1; }}
-        .btn-danger {{ background: #dc2626; color: white; }}
-        .btn-danger:hover {{ background: #b91c1c; }}
-        .btn-success {{ background: #16a34a; color: white; }}
-        .btn-success:hover {{ background: #15803d; }}
-        .btn-warning {{ background: #d97706; color: white; }}
-        .btn-warning:hover {{ background: #b45309; }}
-        .btn-sm {{ padding: 0.35rem 0.75rem; font-size: 0.8rem; }}
-        input[type="text"], input[type="password"], textarea, select {{
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            border: 1px solid #475569;
-            background: #0f172a;
-            color: #e2e8f0;
-            font-size: 0.9rem;
-            font-family: inherit;
-            margin-bottom: 0.8rem;
-        }}
-        textarea {{ min-height: 100px; resize: vertical; }}
-        input:focus, textarea:focus, select:focus {{
-            outline: none;
-            border-color: #38bdf8;
-            box-shadow: 0 0 0 3px rgba(56,189,248,0.2);
-        }}
-        .form-group {{ margin-bottom: 1.2rem; }}
-        .form-group label {{ display: block; margin-bottom: 0.4rem; color: #94a3b8; font-size: 0.88rem; font-weight: 500; }}
-        .alert {{
-            padding: 0.8rem 1.2rem;
-            border-radius: 8px;
-            margin-bottom: 1.2rem;
-            font-size: 0.9rem;
-        }}
-        .alert-success {{ background: #064e3b; border: 1px solid #10b981; color: #6ee7b7; }}
-        .alert-danger {{ background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; }}
-        .badge {{
-            display: inline-block;
-            padding: 0.2rem 0.6rem;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 600;
-        }}
-        .badge-green {{ background: #064e3b; color: #6ee7b7; }}
-        .badge-red {{ background: #450a0a; color: #fca5a5; }}
-        .badge-blue {{ background: #0c4a6e; color: #7dd3fc; }}
-        .tabs {{ display: flex; gap: 0.5rem; margin-bottom: 1.2rem; flex-wrap: wrap; }}
-        .tab {{
-            padding: 0.45rem 0.9rem;
-            border-radius: 8px;
-            background: #334155;
-            color: #94a3b8;
-            text-decoration: none;
-            font-size: 0.82rem;
-            transition: all 0.2s;
-        }}
-        .tab:hover, .tab.active {{ background: #0284c7; color: white; }}
-        .empty-state {{ text-align: center; padding: 2.5rem; color: #64748b; }}
-        .empty-state .icon {{ font-size: 2.5rem; margin-bottom: 0.5rem; }}
-        @media (max-width: 768px) {{
-            .navbar {{ flex-direction: column; gap: 0.8rem; text-align: center; }}
-            .navbar .nav-links {{ justify-content: center; }}
-            .container {{ padding: 0 0.8rem; }}
-        }}
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .navbar { background: #1e293b; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid #334155; }
+        .navbar h1 { font-size: 1.2rem; color: #38bdf8; }
+        .navbar .nav-links { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+        .navbar a { color: #94a3b8; text-decoration: none; padding: 0.5rem 0.8rem; border-radius: 6px; font-size: 0.88rem; transition: all 0.2s; }
+        .navbar a:hover, .navbar a.active { color: #38bdf8; background: #334155; }
+        .navbar a.logout { color: #f87171; }
+        .container { max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; }
+        .card { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; border: 1px solid #334155; box-shadow: 0 4px 6px rgba(0,0,0,0.2); }
+        .card h2 { color: #38bdf8; margin-bottom: 1rem; font-size: 1.15rem; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+        .stat-card { background: linear-gradient(135deg, #1e3a5f, #1e293b); border-radius: 10px; padding: 1.2rem; text-align: center; border: 1px solid #2d4a6f; }
+        .stat-card .number { font-size: 2.2rem; font-weight: bold; color: #38bdf8; }
+        .stat-card .label { color: #94a3b8; margin-top: 0.3rem; font-size: 0.85rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.88rem; }
+        th, td { padding: 0.75rem 0.9rem; text-align: right; border-bottom: 1px solid #334155; }
+        th { background: #334155; color: #38bdf8; font-weight: 600; }
+        tr:hover { background: #253347; }
+        .btn { display: inline-block; padding: 0.55rem 1.1rem; border-radius: 8px; border: none; cursor: pointer; font-size: 0.88rem; font-weight: 600; text-decoration: none; transition: all 0.2s; font-family: inherit; }
+        .btn-primary { background: #0284c7; color: white; }
+        .btn-primary:hover { background: #0369a1; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover { background: #b91c1c; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-success:hover { background: #15803d; }
+        .btn-warning { background: #d97706; color: white; }
+        .btn-warning:hover { background: #b45309; }
+        .btn-sm { padding: 0.3rem 0.65rem; font-size: 0.78rem; }
+        input[type="text"], input[type="password"], textarea, select { width: 100%; padding: 0.7rem 0.9rem; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 0.9rem; font-family: inherit; margin-bottom: 0.8rem; }
+        textarea { min-height: 90px; resize: vertical; }
+        input:focus, textarea:focus, select:focus { outline: none; border-color: #38bdf8; }
+        .form-group { margin-bottom: 1rem; }
+        .form-group label { display: block; margin-bottom: 0.4rem; color: #94a3b8; font-size: 0.85rem; }
+        .alert { padding: 0.8rem 1.2rem; border-radius: 8px; margin-bottom: 1.2rem; font-size: 0.88rem; }
+        .alert-success { background: #064e3b; border: 1px solid #10b981; color: #6ee7b7; }
+        .alert-danger { background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; }
+        .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+        .badge-green { background: #064e3b; color: #6ee7b7; }
+        .badge-red { background: #450a0a; color: #fca5a5; }
+        .badge-blue { background: #0c4a6e; color: #7dd3fc; }
+        .tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; flex-wrap: wrap; }
+        .tab { padding: 0.4rem 0.8rem; border-radius: 8px; background: #334155; color: #94a3b8; text-decoration: none; font-size: 0.8rem; }
+        .tab:hover, .tab.active { background: #0284c7; color: white; }
+        .empty-state { text-align: center; padding: 2rem; color: #64748b; }
+        .empty-state .icon { font-size: 2.2rem; margin-bottom: 0.5rem; }
+        @media (max-width: 768px) {
+            .navbar { flex-direction: column; gap: 0.8rem; text-align: center; }
+            .navbar .nav-links { justify-content: center; }
+            .container { padding: 0 0.8rem; }
+        }
     </style>
 </head>
 <body>
+    {% if session.get('logged_in') %}
     <nav class="navbar">
         <h1>🔧 پنل مدیریت توان‌سازه</h1>
         <div class="nav-links">
-            <a href="{url_for('dashboard')}" class="{'active' if active_tab=='dashboard' else ''}">📊 داشبورد</a>
-            <a href="{url_for('users_page')}" class="{'active' if active_tab=='users' else ''}">👥 کاربران</a>
-            <a href="{url_for('catalogs_page')}" class="{'active' if active_tab=='catalogs' else ''}">📁 کاتالوگ‌ها</a>
-            <a href="{url_for('settings_page')}" class="{'active' if active_tab=='settings' else ''}">⚙️ تنظیمات</a>
-            <a href="{url_for('broadcasts_page')}" class="{'active' if active_tab=='broadcasts' else ''}">📢 پیام‌ها</a>
-            <a href="{url_for('backup_page')}" class="{'active' if active_tab=='backup' else ''}">💾 بکاپ</a>
-            <a href="{url_for('logout')}" class="logout">🚪 خروج</a>
+            <a href="{{ url_for('dashboard') }}" class="{% if active_tab=='dashboard' %}active{% endif %}">📊 داشبورد</a>
+            <a href="{{ url_for('users_page') }}" class="{% if active_tab=='users' %}active{% endif %}">👥 کاربران</a>
+            <a href="{{ url_for('catalogs_page') }}" class="{% if active_tab=='catalogs' %}active{% endif %}">📁 کاتالوگ‌ها</a>
+            <a href="{{ url_for('settings_page') }}" class="{% if active_tab=='settings' %}active{% endif %}">⚙️ تنظیمات</a>
+            <a href="{{ url_for('broadcasts_page') }}" class="{% if active_tab=='broadcasts' %}active{% endif %}">📢 پیام‌ها</a>
+            <a href="{{ url_for('backup_page') }}" class="{% if active_tab=='backup' %}active{% endif %}">💾 بکاپ</a>
+            <a href="{{ url_for('logout') }}" class="logout">🚪 خروج</a>
         </div>
     </nav>
+    {% endif %}
     <div class="container">
-        {{% with messages = get_flashed_messages(with_categories=true) %}}
-        {{% if messages %}}
-            {{% for category, message in messages %}}
-            <div class="alert alert-{{{{ category }}}}">{{{{ message }}}}</div>
-            {{% endfor %}}
-        {{% endif %}}
-        {{% endwith %}}
-        {content_html}
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+        {% endwith %}
+        {{ content|safe }}
     </div>
 </body>
 </html>
 """
-    return render_template_string(full_html)
 
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-        password = request.form.get('password', '')
-        if username == PANEL_USERNAME and password == PANEL_PASSWORD:
-            session['logged_in'] = True
-            session['username'] = username
-            flash('ورود با موفقیت انجام شد.', 'success')
-            return redirect(url_for('dashboard'))
-        flash('نام کاربری یا رمز عبور نادرست است.', 'danger')
-
-    html = """
+LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -286,14 +174,36 @@ def login():
 </body>
 </html>
 """
-    return render_template_string(html)
 
+def login_required(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+def render_page(title, content_html, active_tab='dashboard'):
+    return render_template_string(LAYOUT, page_title=title, content=content_html, active_tab=active_tab)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
+        if username == PANEL_USERNAME and password == PANEL_PASSWORD:
+            session['logged_in'] = True
+            session['username'] = username
+            flash('ورود با موفقیت انجام شد.', 'success')
+            return redirect(url_for('dashboard'))
+        flash('نام کاربری یا رمز عبور نادرست است.', 'danger')
+
+    return render_template_string(LOGIN_TEMPLATE)
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('login'))
-
 
 @app.route('/')
 @login_required
@@ -305,18 +215,9 @@ def dashboard():
     recent_broadcasts = db.get_broadcast_logs(5)
     recent_users = db.get_all_users()[:10]
 
-    cat_rows = ""
-    for cs in cat_stats:
-        cat_rows += f"<tr><td>{cs['category']}</td><td>{cs['cnt']}</td></tr>"
-
-    broadcast_rows = ""
-    for b in recent_broadcasts:
-        broadcast_rows += f"<tr><td>{b['sent_at'][:16]}</td><td>{(b['message_text'] or '')[:50]}...</td><td><span class='badge badge-green'>✅ {b['sent_count']}</span> <span class='badge badge-red'>❌ {b['fail_count']}</span></td></tr>"
-
-    user_rows = ""
-    for u in recent_users:
-        status = "<span class='badge badge-green'>فعال</span>" if not u['is_blocked'] else "<span class='badge badge-red'>بلاک</span>"
-        user_rows += f"<tr><td>{u['user_id']}</td><td>{u['first_name'] or '-'}</td><td>@{u['username'] or '-'}</td><td>{status}</td><td>{u['last_active'][:16] if u['last_active'] else '-'}</td></tr>"
+    cat_rows = "".join([f"<tr><td>{cs['category']}</td><td>{cs['cnt']}</td></tr>" for cs in cat_stats])
+    broadcast_rows = "".join([f"<tr><td>{b['sent_at'][:16]}</td><td>{(b['message_text'] or '')[:50]}...</td><td><span class='badge badge-green'>✅ {b['sent_count']}</span> <span class='badge badge-red'>❌ {b['fail_count']}</span></td></tr>" for b in recent_broadcasts])
+    user_rows = "".join([f"<tr><td>{u['user_id']}</td><td>{u['first_name'] or '-'}</td><td>@{u['username'] or '-'}</td><td>{'<span class=\"badge badge-green\">فعال</span>' if not u['is_blocked'] else '<span class=\"badge badge-red\">بلاک</span>'}</td><td>{u['last_active'][:16] if u['last_active'] else '-'}</td></tr>" for u in recent_users])
 
     content = f"""
     <div class="stats-grid">
@@ -342,7 +243,6 @@ def dashboard():
     </div>
     """
     return render_page("داشبورد", content, 'dashboard')
-
 
 @app.route('/users')
 @login_required
@@ -381,7 +281,6 @@ def users_page():
     """
     return render_page("مدیریت کاربران", content, 'users')
 
-
 @app.route('/users/block/<int:user_id>')
 @login_required
 def block_user(user_id):
@@ -389,14 +288,12 @@ def block_user(user_id):
     flash(f'کاربر {user_id} مسدود شد.', 'success')
     return redirect(url_for('users_page'))
 
-
 @app.route('/users/unblock/<int:user_id>')
 @login_required
 def unblock_user(user_id):
     db.unblock_user(user_id)
     flash(f'کاربر {user_id} از مسدودی خارج شد.', 'success')
     return redirect(url_for('users_page'))
-
 
 @app.route('/catalogs')
 @login_required
@@ -464,7 +361,6 @@ def catalogs_page():
     """
     return render_page("مدیریت کاتالوگ‌ها", content, 'catalogs')
 
-
 @app.route('/catalogs/upload', methods=['POST'])
 @login_required
 def upload_catalog_web():
@@ -478,35 +374,43 @@ def upload_catalog_web():
 
     filename = file.filename
     ext = os.path.splitext(filename)[1].lower()
+    bot_token = os.environ.get('BOT_TOKEN', '')
 
-    if not BOT_TOKEN:
-        flash('توکن ربات (BOT_TOKEN) تنظیم نشده است.', 'danger')
+    if not bot_token:
+        flash('متغیر BOT_TOKEN در تنظیمات Railway تعریف نشده است.', 'danger')
+        return redirect(url_for('catalogs_page'))
+
+    admin_ids = os.environ.get('ADMIN_IDS', '').split(',')
+    chat_id = admin_ids[0].strip() if admin_ids and admin_ids[0].strip() else None
+
+    if not chat_id:
+        flash('متغیر ADMIN_IDS در تنظیمات Railway تعریف نشده است.', 'danger')
         return redirect(url_for('catalogs_page'))
 
     try:
-        admin_id = os.environ.get('ADMIN_IDS', '').split(',')[0]
+        file_bytes = file.stream.read()
         if ext in ['.png', '.jpg', '.jpeg', '.webp']:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            files = {'photo': (filename, file.stream, file.mimetype)}
-            data = {'chat_id': admin_id}
+            url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+            files = {'photo': (filename, file_bytes, file.mimetype or 'image/jpeg')}
+            data = {'chat_id': chat_id}
             resp = requests.post(url, files=files, data=data, timeout=30).json()
 
             if resp.get('ok'):
                 file_id = resp['result']['photo'][-1]['file_id']
                 file_type = 'photo'
             else:
-                raise Exception(resp.get('description', 'Telegram API Upload Failed'))
+                raise Exception(resp.get('description', 'Telegram API Error'))
         else:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-            files = {'document': (filename, file.stream, file.mimetype or 'application/pdf')}
-            data = {'chat_id': admin_id}
+            url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+            files = {'document': (filename, file_bytes, file.mimetype or 'application/pdf')}
+            data = {'chat_id': chat_id}
             resp = requests.post(url, files=files, data=data, timeout=30).json()
 
             if resp.get('ok'):
                 file_id = resp['result']['document']['file_id']
                 file_type = 'document'
             else:
-                raise Exception(resp.get('description', 'Telegram API Upload Failed'))
+                raise Exception(resp.get('description', 'Telegram API Error'))
 
         catalog_id = db.add_catalog(
             category=category,
@@ -523,7 +427,6 @@ def upload_catalog_web():
         flash(f'⚠️ خطا در آپلود فایل: {e}', 'danger')
 
     return redirect(url_for('catalogs_page'))
-
 
 @app.route('/catalogs/edit/<int:catalog_id>', methods=['GET', 'POST'])
 @login_required
@@ -555,7 +458,6 @@ def edit_catalog(catalog_id):
     """
     return render_page("ویرایش کاتالوگ", content, 'catalogs')
 
-
 @app.route('/catalogs/delete/<int:catalog_id>')
 @login_required
 def delete_catalog(catalog_id):
@@ -566,7 +468,6 @@ def delete_catalog(catalog_id):
     else:
         flash('فایل یافت نشد.', 'danger')
     return redirect(url_for('catalogs_page'))
-
 
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
@@ -593,9 +494,7 @@ def settings_page():
     welcome = db.get_setting('welcome_text', '')
     all_settings = db.get_all_settings()
 
-    settings_rows = ""
-    for s in all_settings:
-        settings_rows += f"<tr><td>{s['key']}</td><td>{s['value'][:100] if s['value'] else '-'}</td></tr>"
+    settings_rows = "".join([f"<tr><td>{s['key']}</td><td>{(s['value'] or '')[:100]}</td></tr>" for s in all_settings])
 
     content = f"""
     <div class="card">
@@ -644,23 +543,11 @@ def settings_page():
     """
     return render_page("تنظیمات", content, 'settings')
 
-
 @app.route('/broadcasts')
 @login_required
 def broadcasts_page():
     logs = db.get_broadcast_logs(100)
-    rows = ""
-    for b in logs:
-        total = b['sent_count'] + b['fail_count']
-        rows += f"""<tr>
-            <td>{b['id']}</td>
-            <td>{b['sent_at'][:19] if b['sent_at'] else '-'}</td>
-            <td style="max-width:300px;word-break:break-word;">{(b['message_text'] or '')[:200]}</td>
-            <td><span class="badge badge-green">✅ {b['sent_count']}</span></td>
-            <td><span class="badge badge-red">❌ {b['fail_count']}</span></td>
-            <td>{total}</td>
-            <td>{b['sent_by'] or '-'}</td>
-        </tr>"""
+    rows = "".join([f"<tr><td>{b['id']}</td><td>{b['sent_at'][:19] if b['sent_at'] else '-'}</td><td style='max-width:300px;word-break:break-word;'>{(b['message_text'] or '')[:200]}</td><td><span class='badge badge-green'>✅ {b['sent_count']}</span></td><td><span class='badge badge-red'>❌ {b['fail_count']}</span></td><td>{b['sent_count'] + b['fail_count']}</td><td>{b['sent_by'] or '-'}</td></tr>" for b in logs])
 
     content = f"""
     <div class="card">
@@ -675,7 +562,6 @@ def broadcasts_page():
     </div>
     """
     return render_page("تاریخچه پیام‌ها", content, 'broadcasts')
-
 
 @app.route('/backup')
 @login_required
@@ -703,7 +589,6 @@ def backup_page():
     """
     return render_page("مدیریت بکاپ", content, 'backup')
 
-
 @app.route('/backup/download')
 @login_required
 def download_backup():
@@ -714,7 +599,6 @@ def download_backup():
     except Exception as e:
         flash(f'خطا در ایجاد بکاپ: {e}', 'danger')
         return redirect(url_for('backup_page'))
-
 
 @app.route('/backup/restore', methods=['POST'])
 @login_required
@@ -739,7 +623,6 @@ def restore_backup():
         flash(f'خطا در بازگردانی: {e}', 'danger')
 
     return redirect(url_for('backup_page'))
-
 
 @app.route('/health')
 def health():
