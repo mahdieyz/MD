@@ -256,6 +256,16 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _item_label(item: dict) -> str:
+    ftype = item.get("file_type")
+    if ftype == "text":
+        preview = (item.get("note") or "").strip().replace("\n", " ")
+        return f"📝 {preview[:28]}" if preview else "📝 (متن خالی)"
+    icon = "🖼️" if ftype == "photo" else "📎"
+    label = (item.get("file_name") or item.get("note") or f"فایل #{item['id']}")[:30]
+    return f"{icon} {label}"
+
+
 async def _show_file_list(query, button_id: int):
     items = db.get_catalogs(button_id)
     btn = db.get_button(button_id) if button_id != 0 else None
@@ -265,14 +275,7 @@ async def _show_file_list(query, button_id: int):
     if not items:
         rows.append([InlineKeyboardButton("محتوایی موجود نیست", callback_data="noop")])
     for item in items:
-        ftype = item.get("file_type")
-        if ftype == "text":
-            preview = (item.get("note") or "").strip().replace("\n", " ")
-            label = f"📝 {preview[:28]}" if preview else "📝 (متن خالی)"
-        else:
-            label = (item.get("file_name") or item.get("note") or f"فایل #{item['id']}")[:30]
-            icon = "🖼️" if ftype == "photo" else "📎"
-            label = f"{icon} {label}"
+        label = _item_label(item)
         rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"admdelfile_{item['id']}_{button_id}")])
 
     rows.append([InlineKeyboardButton("📤 افزودن فایل", callback_data=f"admaddfile_{button_id}")])
@@ -366,11 +369,27 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_file_list(query, button_id)
         return
 
-    if data.startswith("admdelfile_"):
+    # confirmation screen before deleting a file/text item
+    if data.startswith("admdelfileyes_"):
         parts = data.split("_")
         catalog_id, button_id = int(parts[1]), int(parts[2])
         db.delete_catalog(catalog_id)
         await _show_file_list(query, button_id)
+        return
+
+    if data.startswith("admdelfile_"):
+        parts = data.split("_")
+        catalog_id, button_id = int(parts[1]), int(parts[2])
+        item = db.get_catalog_by_id(catalog_id)
+        label = _item_label(item) if item else f"#{catalog_id}"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"admdelfileyes_{catalog_id}_{button_id}")],
+            [InlineKeyboardButton("❌ انصراف", callback_data=f"admfiles_{button_id}")],
+        ])
+        await query.edit_message_text(
+            f"⚠️ آیا از حذف این مورد مطمئن هستید؟\n\n{label}",
+            reply_markup=kb,
+        )
         return
 
     if data.startswith("admdelbtnyes_"):
@@ -721,7 +740,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(
         admin_cb_dispatch,
-        pattern=r"^(admhome|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelbtn_|admdelbtnyes_|noop)"
+        pattern=r"^(admhome|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|noop)"
     ))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
