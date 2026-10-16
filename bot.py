@@ -18,33 +18,46 @@ def is_admin(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user = update.effective_user
-    database.add_user(user.id, user.username, user.full_name)
+    if user:
+        database.add_user(user.id, user.username, user.full_name)
     
     welcome_text = database.get_setting("welcome_text", "به ربات توان سازه خوش آمدید.")
     
     keyboard = [[KeyboardButton("📦 محصولات و قیمت‌ها")], [KeyboardButton("📞 تماس با ما")]]
-    if is_admin(user.id):
+    if user and is_admin(user.id):
         keyboard.append([KeyboardButton("🔧 پنل مدیریت")])
         
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    await update.effective_message.reply_text(welcome_text, reply_markup=reply_markup)
+
+async def admin_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    user = update.effective_user
+    if user and is_admin(user.id):
+        await send_admin_menu(update)
+    else:
+        await update.effective_message.reply_text("⛔ شما دسترسی مدیریت ندارید.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ عملیات جاری لغو شد.")
+    await update.effective_message.reply_text("❌ عملیات جاری لغو شد.")
     return ConversationHandler.END
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     text = update.message.text
     user = update.effective_user
-    database.add_user(user.id, user.username, user.full_name)
+    if user:
+        database.add_user(user.id, user.username, user.full_name)
     
     if text == "📦 محصولات و قیمت‌ها":
         await show_user_menu(update, context, parent_id=0)
     elif text == "📞 تماس با ما":
         contact_text = database.get_setting("contact_text", "تماس با ما")
         await update.message.reply_text(contact_text)
-    elif text in ["🔧 پنل مدیریت", "/admin"] and is_admin(user.id):
+    elif text == "🔧 پنل مدیریت" and user and is_admin(user.id):
         await send_admin_menu(update)
 
 async def show_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, parent_id=0):
@@ -87,8 +100,8 @@ async def user_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- مدیریت ربات ---
 
-async def send_admin_menu(update: Update, message_obj=None):
-    target = message_obj or update.message
+async def send_admin_menu(update: Update):
+    target_msg = update.effective_message
     user_count = database.get_user_count()
     
     keyboard = [
@@ -101,7 +114,7 @@ async def send_admin_menu(update: Update, message_obj=None):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     msg = f"🔧 **پنل مدیریت ربات توان سازه**\n\n👥 تعداد کاربران ربات: `{user_count}` نفر"
-    await target.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+    await target_msg.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def admin_inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -168,7 +181,7 @@ async def admin_inline_callback(update: Update, context: ContextTypes.DEFAULT_TY
         database.delete_button(btn_id)
         await query.edit_message_text("✅ دکمه و فایل‌های وابسته با موفقیت حذف شدند.")
 
-# --- گفتگوهای مدیریت (Conversations) ---
+# --- گفتگوهای مدیریت ---
 
 async def prompt_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -237,6 +250,9 @@ async def prompt_add_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_cat_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if not msg:
+        return STATE_ADD_CATALOG_FILE
+
     if msg.photo:
         file_id = msg.photo[-1].file_id
         file_type = "photo"
@@ -244,7 +260,7 @@ async def save_cat_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.document.file_id
         file_type = "document"
     else:
-        await update.message.reply_text("⚠️ لطفاً یک تصویر یا فایل PDF بفرستید (یا جهت لغو /cancel کنید).")
+        await update.message.reply_text("⚠️ لطفاً فقط تصویر یا فایل PDF ارسال کنید (ارسال /cancel برای لغو).")
         return STATE_ADD_CATALOG_FILE
 
     context.user_data['cat_file_id'] = file_id
@@ -284,18 +300,21 @@ def create_bot_app():
             STATE_EDIT_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_contact)],
             STATE_BROADCAST: [MessageHandler(filters.ALL & ~filters.COMMAND, do_broadcast)],
             STATE_ADD_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_btn)],
-            STATE_ADD_CATALOG_FILE: [MessageHandler(filters.PHOTO | filters.Document.ALL, save_cat_file), MessageHandler(filters.ALL & ~filters.COMMAND, save_cat_file)],
+            STATE_ADD_CATALOG_FILE: [
+                MessageHandler(filters.PHOTO | filters.Document.ALL, save_cat_file),
+                MessageHandler(filters.ALL & ~filters.COMMAND, save_cat_file)
+            ],
             STATE_ADD_CATALOG_CAPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_cat_caption)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
-            CommandHandler("admin", lambda u, c: send_admin_menu(u) if is_admin(u.effective_user.id) else None)
+            CommandHandler("admin", admin_command_handler)
         ],
     )
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", lambda u, c: send_admin_menu(u) if is_admin(u.effective_user.id) else None))
+    app.add_handler(CommandHandler("admin", admin_command_handler))
     app.add_handler(CommandHandler("cancel", cancel))
     
     app.add_handler(conv_handler)
