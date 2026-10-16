@@ -18,7 +18,7 @@ class Database:
 
     def _get_conn(self):
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=20.0)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=5000;")
@@ -183,13 +183,12 @@ class Database:
             required = ['users', 'catalogs', 'settings']
             for req in required:
                 if req not in table_names:
-                    raise ValueError(f"فایل انتخاب شده دیتابیس معتبر ربات نیست. جدول {req} یافت نشد.")
+                    raise ValueError(f"جدول {req} یافت نشد.")
         finally:
             test_conn.close()
 
         if hasattr(self._local, 'conn') and self._local.conn:
             try:
-                self._local.conn.execute("PRAGMA wal_checkpoint(FULL);")
                 self._local.conn.close()
             except Exception:
                 pass
