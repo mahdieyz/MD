@@ -60,11 +60,12 @@ if not TOKEN:
     RENAME_BTN,
     UPLOAD_FILE,
     UPLOAD_NOTE,
+    ADD_TEXT,
     SET_CONTACT,
     SET_WELCOME,
     BROADCAST,
     RESTORE_DB,
-) = range(8)
+) = range(9)
 
 # ---------- constants ----------
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
@@ -121,25 +122,31 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, parent_i
 
 async def enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE, btn: dict):
     button_id = btn["id"]
-    files = db.get_catalogs(button_id)
+    items = db.get_catalogs(button_id)
 
-    for f in files:
+    for item in items:
         try:
-            caption = f.get("note") or f.get("file_name") or ""
-            if f["file_type"] == "photo":
-                await update.message.reply_photo(f["file_id"], caption=caption)
+            ftype = item.get("file_type")
+            if ftype == "text":
+                content = item.get("note") or ""
+                if content.strip():
+                    await update.message.reply_text(content)
+            elif ftype == "photo":
+                caption = item.get("note") or item.get("file_name") or ""
+                await update.message.reply_photo(item["file_id"], caption=caption)
             else:
-                await update.message.reply_document(f["file_id"], caption=caption)
+                caption = item.get("note") or item.get("file_name") or ""
+                await update.message.reply_document(item["file_id"], caption=caption)
         except Exception:
-            logger.exception("Failed to send file id=%s", f.get("id"))
+            logger.exception("Failed to send item id=%s", item.get("id"))
 
     children = db.get_buttons(button_id)
     if children:
         context.user_data["parent_id"] = button_id
         kb = build_menu_kb(button_id, update.effective_user.id)
         await update.message.reply_text(btn["title"], reply_markup=kb)
-    elif not files:
-        await update.message.reply_text("فایلی برای این بخش ثبت نشده است.")
+    elif not items:
+        await update.message.reply_text("محتوایی برای این بخش ثبت نشده است.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,9 +185,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btn = db.get_button_by_title_parent(text, current_parent)
 
     # Defensive self-heal: if the keyboard the user is looking at is stale
-    # (e.g. bot restarted and lost in-memory state before persistence was
-    # loaded, or user hasn't pressed anything in a while), try matching
-    # against the root menu before giving up.
+    # (e.g. bot restarted and lost in-memory state, or user hasn't pressed
+    # anything in a while), try matching against the root menu before
+    # giving up.
     if not btn and current_parent != 0:
         root_match = db.get_button_by_title_parent(text, 0)
         if root_match:
@@ -238,6 +245,7 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("➕ افزودن دکمه/گروه", callback_data=f"admaddbtn_{parent_id}")])
     rows.append([InlineKeyboardButton("📤 افزودن فایل به این بخش", callback_data=f"admaddfile_{parent_id}")])
+    rows.append([InlineKeyboardButton("📝 افزودن توضیحات متنی", callback_data=f"admaddtext_{parent_id}")])
 
     if parent_id != 0:
         parent = db.get_button(parent_id)
@@ -249,18 +257,26 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
 
 
 async def _show_file_list(query, button_id: int):
-    files = db.get_catalogs(button_id)
+    items = db.get_catalogs(button_id)
     btn = db.get_button(button_id) if button_id != 0 else None
-    title = f"📄 فایل‌های: {btn['title']}" if btn else "📄 فایل‌های ریشه"
+    title = f"📄 محتوای بخش: {btn['title']}" if btn else "📄 محتوای ریشه"
 
     rows = []
-    if not files:
-        rows.append([InlineKeyboardButton("فایلی موجود نیست", callback_data="noop")])
-    for f in files:
-        label = (f.get("file_name") or f.get("note") or f"فایل #{f['id']}")[:30]
-        rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"admdelfile_{f['id']}_{button_id}")])
+    if not items:
+        rows.append([InlineKeyboardButton("محتوایی موجود نیست", callback_data="noop")])
+    for item in items:
+        ftype = item.get("file_type")
+        if ftype == "text":
+            preview = (item.get("note") or "").strip().replace("\n", " ")
+            label = f"📝 {preview[:28]}" if preview else "📝 (متن خالی)"
+        else:
+            label = (item.get("file_name") or item.get("note") or f"فایل #{item['id']}")[:30]
+            icon = "🖼️" if ftype == "photo" else "📎"
+            label = f"{icon} {label}"
+        rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"admdelfile_{item['id']}_{button_id}")])
 
     rows.append([InlineKeyboardButton("📤 افزودن فایل", callback_data=f"admaddfile_{button_id}")])
+    rows.append([InlineKeyboardButton("📝 افزودن توضیحات متنی", callback_data=f"admaddtext_{button_id}")])
     back_target = btn["parent_id"] if btn else 0
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"admtree_{back_target}")])
 
@@ -379,13 +395,14 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# CONVERSATION FLOWS (add/rename button, upload file, contact, welcome, broadcast, restore)
+# CONVERSATION FLOWS (add/rename button, upload file, add text, contact, welcome, broadcast, restore)
 # =========================================================
 
 def _clear_conv_keys(context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "add_parent", "rename_id", "upload_button_id",
         "upload_file_id", "upload_file_name", "upload_file_type",
+        "text_button_id",
     ):
         context.user_data.pop(key, None)
 
@@ -482,6 +499,33 @@ async def upload_note_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.add_catalog_file(button_id, file_id, file_name, note_text, file_type)
     _clear_conv_keys(context)
     await update.message.reply_text("✅ فایل اضافه شد.")
+    await update.message.reply_text("🌳 مدیریت منو", reply_markup=build_tree_kb(button_id))
+    return ConversationHandler.END
+
+
+async def prompt_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    button_id = int(query.data.split("_")[1])
+    context.user_data["text_button_id"] = button_id
+    await query.edit_message_text(
+        "متن/توضیحات را ارسال کنید (می‌تواند چند جمله یا چند خط باشد).\n"
+        "این متن هنگام ورود کاربر به این بخش نمایش داده می‌شود.\n"
+        "(برای لغو /cancel)"
+    )
+    return ADD_TEXT
+
+
+async def save_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = update.message.text
+    if not content or not content.strip():
+        await update.message.reply_text("متن نمی‌تواند خالی باشد. دوباره ارسال کنید یا /cancel")
+        return ADD_TEXT
+
+    button_id = context.user_data.get("text_button_id", 0)
+    db.add_catalog_file(button_id, "", None, content, "text")
+    _clear_conv_keys(context)
+    await update.message.reply_text("✅ متن اضافه شد.")
     await update.message.reply_text("🌳 مدیریت منو", reply_markup=build_tree_kb(button_id))
     return ConversationHandler.END
 
@@ -639,6 +683,7 @@ def main():
             CallbackQueryHandler(prompt_add_btn, pattern=r"^admaddbtn_"),
             CallbackQueryHandler(prompt_rename_btn, pattern=r"^admrenamebtn_"),
             CallbackQueryHandler(prompt_add_file, pattern=r"^admaddfile_"),
+            CallbackQueryHandler(prompt_add_text, pattern=r"^admaddtext_"),
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
             CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
             CallbackQueryHandler(prompt_broadcast, pattern=r"^admbroadcast$"),
@@ -649,6 +694,7 @@ def main():
             RENAME_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rename_btn)],
             UPLOAD_FILE: [MessageHandler((filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND, upload_file_receive)],
             UPLOAD_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, upload_note_receive)],
+            ADD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_text)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             BROADCAST: [MessageHandler(~filters.COMMAND, broadcast_receive)],
