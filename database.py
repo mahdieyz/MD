@@ -86,7 +86,7 @@ def reset_bot_config():
     finally:
         conn.close()
 
-# --- کاربرها ---
+# --- مدیریت کاربران ---
 def add_user(user_id, username, full_name):
     conn = get_db_connection()
     conn.execute('''
@@ -111,7 +111,7 @@ def get_user_count():
     conn.close()
     return count
 
-# --- دکمه‌ها و کاتالوگ‌ها ---
+# --- مدیریت دکمه‌ها و کاتالوگ‌ها ---
 def get_buttons(parent_id=0, admin_mode=False):
     conn = get_db_connection()
     if admin_mode:
@@ -135,9 +135,22 @@ def add_menu_button(title, parent_id=0):
     conn.close()
 
 def delete_button(button_id):
+    """حذف بازگشتی دکمه و تمامی زیرمنوها و فایل‌های آن"""
     conn = get_db_connection()
-    conn.execute("DELETE FROM catalogs WHERE button_id=?", (button_id,))
-    conn.execute("DELETE FROM menu_buttons WHERE id=?", (button_id,))
+    cursor = conn.cursor()
+    
+    def get_all_child_ids(b_id):
+        ids = [b_id]
+        children = cursor.execute("SELECT id FROM menu_buttons WHERE parent_id=?", (b_id,)).fetchall()
+        for child in children:
+            ids.extend(get_all_child_ids(child['id']))
+        return ids
+
+    all_ids = get_all_child_ids(button_id)
+    placeholders = ",".join("?" * len(all_ids))
+    cursor.execute(f"DELETE FROM catalogs WHERE button_id IN ({placeholders})", all_ids)
+    cursor.execute(f"DELETE FROM menu_buttons WHERE id IN ({placeholders})", all_ids)
+    
     conn.commit()
     conn.close()
 
