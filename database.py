@@ -4,15 +4,18 @@ import os
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 def get_db_connection():
-    # استفاده از حالت WAL برای جلوگیری از خطای database is locked
-    conn = sqlite3.connect(DB_PATH, timeout=5000)
+    # فعال‌سازی WAL Mode برای جلوگیری از قفل شدن دیتابیس (database is locked)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.', exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+        
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -26,7 +29,7 @@ def init_db():
         is_blocked INTEGER DEFAULT 0
     )''')
     
-    # جدول دکمه‌های منو (تودرتو)
+    # جدول دکمه‌های منو
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS menu_buttons (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +50,7 @@ def init_db():
         FOREIGN KEY(button_id) REFERENCES menu_buttons(id) ON DELETE CASCADE
     )''')
     
-    # جدول تنظیمات عمومی
+    # جدول تنظیمات
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -59,16 +62,14 @@ def init_db():
     conn.close()
 
 def _seed_defaults(cursor):
-    """تنظیمات پیش‌فرض کارخانه"""
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_text', 'به ربات توان سازه خوش آمدید.')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('contact_text', 'تماس با ما: 021000000')")
-    # بررسی وجود دکمه محصولات به عنوان ریشه
     cursor.execute("SELECT COUNT(*) FROM menu_buttons")
     if cursor.fetchone()[0] == 0:
         cursor.execute("INSERT INTO menu_buttons (title, parent_id) VALUES ('محصولات و قیمت‌ها', 0)")
 
 def reset_bot_config():
-    """حذف دکمه‌ها، کاتالوگ‌ها و تنظیمات و بازگشت به حالت کارخانه (کاربران حذف نمی‌شوند)"""
+    """بازنشانی کامل دکمه‌ها، کاتالوگ‌ها و تنظیمات به حالت اولیه"""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -81,12 +82,12 @@ def reset_bot_config():
         return True
     except Exception as e:
         conn.rollback()
-        print(f"Reset error: {e}")
+        print(f"Database Reset Error: {e}")
         return False
     finally:
         conn.close()
 
-# --- User Management ---
+# --- کاربرها ---
 def add_user(user_id, username, full_name):
     conn = get_db_connection()
     conn.execute('''
@@ -95,7 +96,7 @@ def add_user(user_id, username, full_name):
         ON CONFLICT(user_id) DO UPDATE SET 
         username=excluded.username, 
         full_name=excluded.full_name
-    ''', (user_id, username, full_name))
+    ''', (user_id, username or "", full_name or ""))
     conn.commit()
     conn.close()
 
@@ -105,7 +106,19 @@ def get_all_users():
     conn.close()
     return [dict(u) for u in users]
 
-# --- Menu & Catalogs ---
+def get_user_count():
+    conn = get_db_connection()
+    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return count
+
+def toggle_block_user(user_id):
+    conn = get_db_connection()
+    conn.execute("UPDATE users SET is_blocked = CASE WHEN is_blocked=1 THEN 0 ELSE 1 END WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# --- دکمه‌ها و کاتالوگ‌ها ---
 def get_buttons(parent_id=0, admin_mode=False):
     conn = get_db_connection()
     if admin_mode:
@@ -128,6 +141,19 @@ def add_menu_button(title, parent_id=0):
     conn.commit()
     conn.close()
 
+def delete_button(button_id):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM catalogs WHERE button_id=?", (button_id,))
+    conn.execute("DELETE FROM menu_buttons WHERE id=?", (button_id,))
+    conn.commit()
+    conn.close()
+
+def toggle_button_hide(button_id):
+    conn = get_db_connection()
+    conn.execute("UPDATE menu_buttons SET is_hidden = CASE WHEN is_hidden=1 THEN 0 ELSE 1 END WHERE id=?", (button_id,))
+    conn.commit()
+    conn.close()
+
 def add_catalog(button_id, file_id, file_type, caption):
     conn = get_db_connection()
     conn.execute("INSERT INTO catalogs (button_id, file_id, file_type, caption) VALUES (?, ?, ?, ?)", 
@@ -141,7 +167,13 @@ def get_catalogs(button_id):
     conn.close()
     return [dict(c) for c in catalogs]
 
-# --- Settings ---
+def delete_catalog(catalog_id):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM catalogs WHERE id=?", (catalog_id,))
+    conn.commit()
+    conn.close()
+
+# --- تنظیمات ---
 def get_setting(key, default=""):
     conn = get_db_connection()
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
