@@ -61,9 +61,10 @@ if not TOKEN:
     UPLOAD_FILE,
     UPLOAD_NOTE,
     SET_CONTACT,
+    SET_WELCOME,
     BROADCAST,
     RESTORE_DB,
-) = range(7)
+) = range(8)
 
 # ---------- constants ----------
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
@@ -211,6 +212,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def admin_home_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("🌳 مدیریت منو", callback_data="admtree_0")],
+        [InlineKeyboardButton("👋 پیام خوش‌آمدگویی", callback_data="admwelcome")],
         [InlineKeyboardButton("📞 تنظیم متن تماس", callback_data="admcontact")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="admbroadcast")],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="admbackup")],
@@ -377,7 +379,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# CONVERSATION FLOWS (add/rename button, upload file, contact, broadcast, restore)
+# CONVERSATION FLOWS (add/rename button, upload file, contact, welcome, broadcast, restore)
 # =========================================================
 
 def _clear_conv_keys(context: ContextTypes.DEFAULT_TYPE):
@@ -498,6 +500,34 @@ async def set_contact_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
+async def prompt_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current = db.get_setting("welcome_text", WELCOME_TEXT_DEFAULT)
+    await query.edit_message_text(
+        "پیام خوش‌آمدگویی فعلی (که با دستور /start نمایش داده می‌شود):\n\n"
+        f"{current}\n\n"
+        "متن جدید را ارسال کنید.\n"
+        "نکته: اگر از {name} در متن استفاده کنید، با نام کوچک کاربر جایگزین می‌شود.\n"
+        "(برای لغو /cancel)"
+    )
+    return SET_WELCOME
+
+
+async def set_welcome_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_text = update.message.text
+    if not new_text or not new_text.strip():
+        await update.message.reply_text("متن نمی‌تواند خالی باشد. دوباره ارسال کنید یا /cancel")
+        return SET_WELCOME
+
+    db.set_setting("welcome_text", new_text)
+
+    preview = new_text.replace("{name}", update.effective_user.first_name or "")
+    await update.message.reply_text("✅ پیام خوش‌آمدگویی بروزرسانی شد.\n\nپیش‌نمایش:\n\n" + preview)
+    await update.message.reply_text("🔧 پنل مدیریت", reply_markup=admin_home_kb())
+    return ConversationHandler.END
+
+
 async def prompt_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -610,6 +640,7 @@ def main():
             CallbackQueryHandler(prompt_rename_btn, pattern=r"^admrenamebtn_"),
             CallbackQueryHandler(prompt_add_file, pattern=r"^admaddfile_"),
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
+            CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
             CallbackQueryHandler(prompt_broadcast, pattern=r"^admbroadcast$"),
             CallbackQueryHandler(prompt_restore, pattern=r"^admrestore$"),
         ],
@@ -619,6 +650,7 @@ def main():
             UPLOAD_FILE: [MessageHandler((filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND, upload_file_receive)],
             UPLOAD_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, upload_note_receive)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
+            SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             BROADCAST: [MessageHandler(~filters.COMMAND, broadcast_receive)],
             RESTORE_DB: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, restore_db_receive)],
         },
