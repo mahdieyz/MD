@@ -1,4 +1,5 @@
 import os
+import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -6,20 +7,38 @@ from telegram.ext import (
 )
 import database
 
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip() and x.strip().isdigit()]
+
+def parse_admin_ids():
+    raw = os.getenv("ADMIN_IDS", "")
+    ids = []
+    clean_raw = raw.replace('"', '').replace("'", "").replace("[", "").replace("]", "")
+    for part in clean_raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.append(int(part))
+    return ids
+
+ADMIN_IDS = parse_admin_ids()
 
 (STATE_EDIT_WELCOME, STATE_EDIT_CONTACT, STATE_BROADCAST, 
  STATE_ADD_BTN, STATE_ADD_CATALOG_FILE, STATE_ADD_CATALOG_CAPTION) = range(6)
 
 def is_admin(user_id):
-    return user_id in ADMIN_IDS if user_id else False
+    if not user_id:
+        return False
+    return int(user_id) in ADMIN_IDS
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user = update.effective_user
     if user:
-        database.add_user(user.id, user.username, user.full_name)
+        try:
+            database.add_user(user.id, user.username, user.full_name)
+        except Exception as e:
+            logger.error(f"Error adding user: {e}")
     
     welcome_text = database.get_setting("welcome_text", "به ربات توان سازه خوش آمدید.")
     
@@ -29,14 +48,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.effective_message.reply_text(welcome_text, reply_markup=reply_markup)
+    return ConversationHandler.END
 
 async def admin_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user = update.effective_user
-    if user and is_admin(user.id):
+    if not user:
+        return ConversationHandler.END
+
+    if is_admin(user.id):
         await send_admin_menu(update)
     else:
-        await update.effective_message.reply_text("⛔ شما دسترسی مدیریت ندارید.")
+        await update.effective_message.reply_text(
+            f"⛔ شما دسترسی مدیریت ندارید.\n\n🆔 آیدی تلگرام شما: `{user.id}`\n\nلطفاً این آیدی را در متغیر ADMIN_IDS تنظیم کنید.",
+            parse_mode="Markdown"
+        )
+    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -281,6 +308,9 @@ async def save_cat_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ کاتالوگ/تصویر با موفقیت در این دکمه ذخیره شد.")
     return ConversationHandler.END
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
 def create_bot_app():
     if not BOT_TOKEN:
         raise ValueError("متغیر BOT_TOKEN در تنظیمات Railway تعریف نشده است!")
@@ -321,5 +351,6 @@ def create_bot_app():
     app.add_handler(CallbackQueryHandler(user_menu_callback, pattern="^umenu_"))
     app.add_handler(CallbackQueryHandler(admin_inline_callback, pattern="^(adm_|confirm_sys_reset|cancel_sys_reset)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
     
     return app
