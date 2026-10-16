@@ -2,7 +2,9 @@ import sqlite3
 import os
 import threading
 import shutil
-import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Database:
     _local = threading.local()
@@ -16,8 +18,11 @@ class Database:
 
     def _get_conn(self):
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._local.conn.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=20.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+            self._local.conn = conn
         return self._local.conn
 
     def _init_db(self):
@@ -54,11 +59,6 @@ class Database:
             fail_count INTEGER,
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             sent_by INTEGER
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS admin_users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.commit()
 
@@ -183,16 +183,21 @@ class Database:
             required = ['users', 'catalogs', 'settings']
             for req in required:
                 if req not in table_names:
-                    raise ValueError(f"Missing required table: {req}")
+                    raise ValueError(f"فایل انتخاب شده دیتابیس معتبر ربات نیست. جدول {req} یافت نشد.")
         finally:
             test_conn.close()
 
-        pre_backup = self.db_path + '.pre_restore_backup'
-        shutil.copy2(self.db_path, pre_backup)
-
         if hasattr(self._local, 'conn') and self._local.conn:
-            self._local.conn.close()
+            try:
+                self._local.conn.execute("PRAGMA wal_checkpoint(FULL);")
+                self._local.conn.close()
+            except Exception:
+                pass
             self._local.conn = None
+
+        pre_backup = self.db_path + '.pre_restore_backup'
+        if os.path.exists(self.db_path):
+            shutil.copy2(self.db_path, pre_backup)
 
         shutil.copy2(restore_path, self.db_path)
         self._init_db()
