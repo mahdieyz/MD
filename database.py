@@ -1,139 +1,155 @@
-import os, json, sqlite3, shutil, logging
-from datetime import datetime
+import sqlite3
+import os
 
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
-class Database:
-    def __init__(self):
-        self.db_name = DB_PATH
-        # FIX #1: Ensure parent directory exists (needed for Railway Volume)
-        db_dir = os.path.dirname(self.db_name)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            logging.info(f"📁 Created DB directory: {db_dir}")
-        self.init_db()
+def get_db_connection():
+    # استفاده از حالت WAL برای جلوگیری از خطای database is locked
+    conn = sqlite3.connect(DB_PATH, timeout=5000)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
-    def conn(self):
-        c = sqlite3.connect(self.db_name)
-        c.row_factory = sqlite3.Row
-        return c
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else '.', exist_ok=True)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # جدول کاربران
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_blocked INTEGER DEFAULT 0
+    )''')
+    
+    # جدول دکمه‌های منو (تودرتو)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS menu_buttons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parent_id INTEGER DEFAULT 0,
+        title TEXT NOT NULL,
+        is_hidden INTEGER DEFAULT 0,
+        order_index INTEGER DEFAULT 0
+    )''')
+    
+    # جدول کاتالوگ‌ها
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS catalogs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        button_id INTEGER,
+        file_id TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        caption TEXT,
+        FOREIGN KEY(button_id) REFERENCES menu_buttons(id) ON DELETE CASCADE
+    )''')
+    
+    # جدول تنظیمات عمومی
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    
+    _seed_defaults(cursor)
+    conn.commit()
+    conn.close()
 
-    def init_db(self):
-        c = self.conn()
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, username TEXT,
-                first_name TEXT, last_name TEXT,
-                join_date TEXT, last_activity TEXT
-            );
-            CREATE TABLE IF NOT EXISTS catalogs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_key TEXT,
-                title TEXT,
-                file_id TEXT,
-                file_name TEXT,
-                file_type TEXT DEFAULT 'document',
-                note TEXT,
-                created_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY, value TEXT
-            );
-        """)
-        c.commit(); c.close()
+def _seed_defaults(cursor):
+    """تنظیمات پیش‌فرض کارخانه"""
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_text', 'به ربات توان سازه خوش آمدید.')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('contact_text', 'تماس با ما: 021000000')")
+    # بررسی وجود دکمه محصولات به عنوان ریشه
+    cursor.execute("SELECT COUNT(*) FROM menu_buttons")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO menu_buttons (title, parent_id) VALUES ('محصولات و قیمت‌ها', 0)")
 
-    # ── USERS ──
-    def add_user(self, uid, uname, fname, lname):
-        conn = self.conn()
-        now = datetime.now().isoformat()
-        conn.execute(
-            "INSERT INTO users (user_id,username,first_name,last_name,join_date,last_activity) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET "
-            "username=excluded.username, first_name=excluded.first_name, "
-            "last_name=excluded.last_name, last_activity=excluded.last_activity",
-            (uid, uname, fname, lname, now, now))
-        conn.commit(); conn.close()
+def reset_bot_config():
+    """حذف دکمه‌ها، کاتالوگ‌ها و تنظیمات و بازگشت به حالت کارخانه (کاربران حذف نمی‌شوند)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM catalogs;")
+        cursor.execute("DELETE FROM menu_buttons;")
+        cursor.execute("DELETE FROM settings;")
+        conn.commit()
+        _seed_defaults(cursor)
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"Reset error: {e}")
+        return False
+    finally:
+        conn.close()
 
-    def get_all_users(self):
-        c = self.conn()
-        rows = [dict(r) for r in c.execute("SELECT * FROM users").fetchall()]
-        c.close(); return rows
+# --- User Management ---
+def add_user(user_id, username, full_name):
+    conn = get_db_connection()
+    conn.execute('''
+        INSERT INTO users (user_id, username, full_name) 
+        VALUES (?, ?, ?) 
+        ON CONFLICT(user_id) DO UPDATE SET 
+        username=excluded.username, 
+        full_name=excluded.full_name
+    ''', (user_id, username, full_name))
+    conn.commit()
+    conn.close()
 
-    # ── CATALOGS ──
-    def add_catalog_file(self, cat_key, title, file_id, file_name="", note="", file_type="document"):
-        c = self.conn()
-        c.execute(
-            "INSERT INTO catalogs (category_key, title, file_id, file_name, file_type, note, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (cat_key, title, file_id, file_name, file_type, note, datetime.now().isoformat()))
-        c.commit(); c.close()
+def get_all_users():
+    conn = get_db_connection()
+    users = conn.execute("SELECT * FROM users ORDER BY joined_at DESC").fetchall()
+    conn.close()
+    return [dict(u) for u in users]
 
-    def get_catalogs(self, cat_key):
-        c = self.conn()
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM catalogs WHERE category_key=? ORDER BY id ASC", (cat_key,)).fetchall()]
-        c.close(); return rows
+# --- Menu & Catalogs ---
+def get_buttons(parent_id=0, admin_mode=False):
+    conn = get_db_connection()
+    if admin_mode:
+        buttons = conn.execute("SELECT * FROM menu_buttons WHERE parent_id=? ORDER BY order_index, id", (parent_id,)).fetchall()
+    else:
+        buttons = conn.execute("SELECT * FROM menu_buttons WHERE parent_id=? AND is_hidden=0 ORDER BY order_index, id", (parent_id,)).fetchall()
+    conn.close()
+    return [dict(b) for b in buttons]
 
-    def get_catalog_by_id(self, cat_id):
-        c = self.conn()
-        r = c.execute("SELECT * FROM catalogs WHERE id=?", (cat_id,)).fetchone()
-        c.close(); return dict(r) if r else None
+def get_button(button_id):
+    conn = get_db_connection()
+    btn = conn.execute("SELECT * FROM menu_buttons WHERE id=?", (button_id,)).fetchone()
+    conn.close()
+    return dict(btn) if btn else None
 
-    def delete_catalog(self, cat_id):
-        c = self.conn()
-        c.execute("DELETE FROM catalogs WHERE id=?", (cat_id,))
-        c.commit(); c.close()
+def add_menu_button(title, parent_id=0):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO menu_buttons (title, parent_id) VALUES (?, ?)", (title, parent_id))
+    conn.commit()
+    conn.close()
 
-    def count_catalogs_by_category(self):
-        c = self.conn()
-        rows = c.execute(
-            "SELECT category_key, COUNT(*) as cnt FROM catalogs GROUP BY category_key"
-        ).fetchall()
-        c.close(); return {r["category_key"]: r["cnt"] for r in rows}
+def add_catalog(button_id, file_id, file_type, caption):
+    conn = get_db_connection()
+    conn.execute("INSERT INTO catalogs (button_id, file_id, file_type, caption) VALUES (?, ?, ?, ?)", 
+                 (button_id, file_id, file_type, caption))
+    conn.commit()
+    conn.close()
 
-    # ── SETTINGS ──
-    def set_setting(self, key, val):
-        c = self.conn()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, val))
-        c.commit(); c.close()
+def get_catalogs(button_id):
+    conn = get_db_connection()
+    catalogs = conn.execute("SELECT * FROM catalogs WHERE button_id=?", (button_id,)).fetchall()
+    conn.close()
+    return [dict(c) for c in catalogs]
 
-    def get_setting(self, key, default=""):
-        c = self.conn()
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        c.close(); return r["value"] if r else default
+# --- Settings ---
+def get_setting(key, default=""):
+    conn = get_db_connection()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row['value'] if row else default
 
-    # ── STATS ──
-    def get_stats(self):
-        c = self.conn()
-        u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        f = c.execute("SELECT COUNT(*) FROM catalogs").fetchone()[0]
-        c.close()
-        return {"total_users": u, "total_files": f}
-
-    # ── BACKUP / RESTORE ──
-    def backup_to_file(self, target_path):
-        """Safe backup using SQLite's online backup API."""
-        src = sqlite3.connect(self.db_name)
-        dst = sqlite3.connect(target_path)
-        with dst:
-            src.backup(dst)
-        dst.close()
-        src.close()
-        return target_path
-
-    def restore_from_file(self, source_path):
-        """Validate and restore from a .db file. Returns True on success."""
-        try:
-            # FIX #6: Validate it's a real SQLite DB
-            test = sqlite3.connect(source_path)
-            test.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            test.close()
-            # Backup current, then replace
-            if os.path.exists(self.db_name):
-                self.backup_to_file(self.db_name + ".pre_restore_backup")
-            shutil.copy2(source_path, self.db_name)
-            return True
-        except Exception as e:
-            logging.error(f"Restore failed: {e}")
-            return False
+def update_setting(key, value):
+    conn = get_db_connection()
+    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    conn.commit()
+    conn.close()
