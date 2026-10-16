@@ -1,433 +1,483 @@
-import os
-import re
-import logging
-import asyncio
-from telegram import Update, ReplyKeyboardMarkup
+import os, re, logging
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters
 )
 from database import Database
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("bot")
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 db = Database()
+TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
 
-def get_admin_ids():
-    raw = os.environ.get("ADMIN_IDS", "")
-    ids = []
-    for x in raw.split(","):
-        x = x.strip()
-        if x.isdigit():
-            ids.append(int(x))
-    return ids
+UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, BROADCAST, RESTORE_DB, MANAGE_CAT = range(7)
 
-MAIN_MENU = [
-    ["مگنتار و چراغ لاینی"],
-    ["کلید ، پریز هوشمند و مکانیکی"],
-    ["صنعتی ساختمانی"],
-    ["نمای ساختمان - محوطه - استخری"],
-    ["سیم و کابل"],
-    ["آیفون"],
-    ["اعلان حریق"],
-    ["پریز کابینتی میلو"],
-    ["پریز کابینتی ملونی"],
-    ["🛒 ثبت سفارش / تماس با ما"],
-]
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
-SUB_MENUS = {
-    "نمای ساختمان - محوطه - استخری": [
-        ["مد نور"], ["شعاع"], ["انوار"], ["🔙 بازگشت"]
-    ],
-    "کلید ، پریز هوشمند و مکانیکی": [
-        ["هوشمند"], ["مکانیکی"], ["🔙 بازگشت"]
-    ],
+# ── KEYBOARDS ──
+
+CATEGORY_MAP = {
+    "مد نور": "mod_noor",
+    "مگنتار و چراغ لاینی": "magnetar_line",
+    "صنعتی ساختمانی": "industrial",
+    "سیم و کابل": "wire_cable",
+    "آیفون": "intercom",
+    "اعلان حریق": "fire_alarm",
+    "پریز کابینتی میلو": "milo_socket",
+    "پریز کابینتی ملونی": "meloni_socket",
+    "شعاع": "shaa",
+    "انوار": "anvar",
+    "پریز و کلید هوشمند": "smart_switches",
+    "کلید مکانیکی": "mechanical_switches",
 }
 
-ALL_BUTTONS = set()
-for row in MAIN_MENU:
-    ALL_BUTTONS.update(row)
-for sub in SUB_MENUS.values():
-    for row in sub:
-        ALL_BUTTONS.update(row)
+BACK_BTN = "بازگشت به منوی اصلی"
 
-BUTTON_REGEX = re.compile("^(" + "|".join(re.escape(b) for b in sorted(ALL_BUTTONS, key=len, reverse=True)) + ")$")
+def main_menu_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("مگنتار و چراغ لاینی"), KeyboardButton("کلید ، پریز هوشمند و مکانیکی")],
+        [KeyboardButton("صنعتی ساختمانی"), KeyboardButton("نمای ساختمان - محوطه - استخری")],
+        [KeyboardButton("سیم و کابل"), KeyboardButton("آیفون"), KeyboardButton("اعلان حریق")],
+        [KeyboardButton("پریز کابینتی میلو"), KeyboardButton("پریز کابینتی ملونی")],
+        [KeyboardButton("🛒 ثبت سفارش / تماس با ما")]
+    ], resize_keyboard=True)
 
-(
-    ADMIN_MENU, UPLOAD_CATEGORY, UPLOAD_FILE, UPLOAD_NOTE,
-    DELETE_SELECT_CAT, DELETE_SELECT_ITEM,
-    EDIT_CONTACT, BROADCAST_MSG, RESTORE_DB,
-) = range(9)
+def facade_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("مد نور"), KeyboardButton("شعاع"), KeyboardButton("انوار")],
+        [KeyboardButton(BACK_BTN)]
+    ], resize_keyboard=True)
 
-ADMIN_KEYBOARD = [
-    ["📤 آپلود PDF / کاتالوگ"],
-    ["🗑️ مدیریت / حذف کاتالوگ"],
-    ["📞 اطلاعات تماس"],
-    ["📢 پیام همگانی"],
-    ["📊 آمار"],
-    ["💾 دانلود بکاپ"],
-    ["📥 بازگردانی بکاپ"],
-    ["❌ خروج از پنل"],
-]
+def switches_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("پریز و کلید هوشمند"), KeyboardButton("کلید مکانیکی")],
+        [KeyboardButton(BACK_BTN)]
+    ], resize_keyboard=True)
 
-def is_admin(user_id: int) -> bool:
-    return user_id in get_admin_ids()
+def back_only_kb():
+    return ReplyKeyboardMarkup([[KeyboardButton(BACK_BTN)]], resize_keyboard=True)
 
+# FIX #4: Only match real button texts (so notes aren't swallowed)
+ALL_BUTTONS = set(CATEGORY_MAP.keys()) | {
+    BACK_BTN, "منوی اصلی",
+    "نمای ساختمان - محوطه - استخری",
+    "کلید ، پریز هوشمند و مکانیکی",
+    "🛒 ثبت سفارش / تماس با ما",
+}
+BUTTON_REGEX = "^(" + "|".join(re.escape(b) for b in ALL_BUTTONS) + ")$"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.register_user(user.id, user.username, user.first_name, user.last_name)
-    welcome = db.get_setting(
-        "welcome_text",
-        f"سلام {user.first_name or ''} 👋\nبه ربات کاتالوگ توان سازه خوش آمدید.\nلطفاً یک دسته‌بندی را انتخاب کنید:",
-    )
-    await update.message.reply_text(welcome, reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True))
+# ── BASIC COMMANDS ──
 
+async def start(update: Update, ctx):
+    u = update.effective_user
+    db.add_user(u.id, u.username, u.first_name, u.last_name)
+    # FIX #3: Correct {name} substitution
+    template = db.get_setting("welcome_text")
+    if template:
+        welcome = template.replace("{name}", u.first_name or "کاربر")
+    else:
+        welcome = (f"سلام {u.first_name or 'کاربر'} عزیز! 👋\n"
+                   "به ربات توان سازه خوش آمدید.\n"
+                   "جهت دریافت لیست قیمت و کاتالوگ، از منوی زیر استفاده کنید:")
+    await update.message.reply_text(welcome, reply_markup=main_menu_kb())
 
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    user = update.effective_user
-    db.register_user(user.id, user.username, user.first_name, user.last_name)
+async def cancel_cmd(update: Update, ctx):
+    # FIX #5: Works from both message and callback contexts
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ لغو شد. از منوی اصلی انتخاب کنید:", reply_markup=main_menu_kb())
+    return ConversationHandler.END
 
-    if text == "🔙 بازگشت":
-        await update.message.reply_text("دسته‌بندی اصلی:", reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True))
+# ── MAIN MESSAGE HANDLER ──
+
+async def handle_message(update: Update, ctx):
+    text = update.message.text
+    chat_id = update.effective_chat.id
+
+    if text in (BACK_BTN, "منوی اصلی"):
+        await update.message.reply_text("منوی اصلی 👇", reply_markup=main_menu_kb())
+        return
+
+    if text == "نمای ساختمان - محوطه - استخری":
+        await update.message.reply_text("برند مورد نظر را انتخاب کنید:", reply_markup=facade_kb())
+        return
+
+    if text == "کلید ، پریز هوشمند و مکانیکی":
+        await update.message.reply_text("دسته‌بندی را انتخاب کنید:", reply_markup=switches_kb())
         return
 
     if text == "🛒 ثبت سفارش / تماس با ما":
-        contact = db.get_setting(
-            "contact_text",
-            "📞 برای ثبت سفارش با ما تماس بگیرید:\n\n📱 شماره تماس: 09123456789",
-        )
-        await update.message.reply_text(contact)
+        contact = db.get_setting("contact_text",
+            "📞 *ارتباط با واحد فروش توان سازه*\n\n"
+            "📲 تلفن: 021-12345678\n"
+            "👤 پشتیبانی: @Tavansazeh_Admin")
+        await update.message.reply_text(contact, parse_mode="Markdown", reply_markup=main_menu_kb())
         return
 
-    if text in SUB_MENUS:
+    if text in CATEGORY_MAP:
+        cat_key = CATEGORY_MAP[text]
+        files = db.get_catalogs(cat_key)
+        if not files:
+            await update.message.reply_text(
+                f"📂 هنوز کاتالوگی برای «{text}» ثبت نشده است.\n"
+                "به زودی لیست قیمت جدید قرار می‌گیرد.",
+                reply_markup=back_only_kb())
+            return
+
+        await update.message.reply_text(f"⏳ ارسال کاتالوگ «{text}»...")
+        sent = 0
+        for item in files:
+            try:
+                if item.get("file_type") == "photo":
+                    await ctx.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=item["file_id"],
+                        caption=item["note"] or None)
+                else:
+                    await ctx.bot.send_document(
+                        chat_id=chat_id,
+                        document=item["file_id"],
+                        caption=item["note"] or None)
+                sent += 1
+            except Exception as e:
+                logger.error(f"Send file fail for cat={cat_key}: {e}")
+
         await update.message.reply_text(
-            f"📂 {text}\nزیردسته را انتخاب کنید:",
-            reply_markup=ReplyKeyboardMarkup(SUB_MENUS[text], resize_keyboard=True),
-        )
+            f"✅ {sent} فایل ارسال شد." if sent else "⚠️ ارسال ناموفق بود.",
+            reply_markup=back_only_kb())
         return
 
-    catalogs = db.get_catalogs(text)
-    if not catalogs:
-        await update.message.reply_text(f"📂 {text}\n\nفایلی در این دسته‌بندی موجود نیست.")
-        return
+# ── ADMIN PANEL ──
 
-    for cat in catalogs:
-        parts = []
-        if cat["caption"]:
-            parts.append(cat["caption"])
-        if cat["custom_note"]:
-            parts.append(f"📌 {cat['custom_note']}")
-        caption = "\n\n".join(parts) if parts else None
-        try:
-            if cat["file_type"] == "photo":
-                await update.message.reply_photo(photo=cat["file_id"], caption=caption)
-            else:
-                await update.message.reply_document(document=cat["file_id"], caption=caption)
-        except Exception as e:
-            logger.error("Send catalog %s failed: %s", cat["id"], e)
-            await update.message.reply_text(f"⚠️ خطا در ارسال فایل #{cat['id']}")
+def admin_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 آپلود PDF / کاتالوگ", callback_data="adm_upload")],
+        [InlineKeyboardButton("🗑️ مدیریت / حذف کاتالوگ", callback_data="adm_manage_pick"),
+         InlineKeyboardButton("📞 اطلاعات تماس", callback_data="adm_contact")],
+        [InlineKeyboardButton("💾 دانلود بکاپ", callback_data="adm_backup"),
+         InlineKeyboardButton("📥 بازگردانی بکاپ", callback_data="adm_restore")],
+        [InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"),
+         InlineKeyboardButton("📊 آمار", callback_data="adm_stats")]
+    ])
 
+def cat_picker_kb(prefix):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("مد نور", callback_data=f"{prefix}mod_noor"),
+         InlineKeyboardButton("مگنتار/لاینی", callback_data=f"{prefix}magnetar_line")],
+        [InlineKeyboardButton("صنعتی ساختمانی", callback_data=f"{prefix}industrial"),
+         InlineKeyboardButton("نمای ساختمان", callback_data=f"{prefix}facade")],
+        [InlineKeyboardButton("شعاع", callback_data=f"{prefix}shaa"),
+         InlineKeyboardButton("انوار", callback_data=f"{prefix}anvar")],
+        [InlineKeyboardButton("سیم و کابل", callback_data=f"{prefix}wire_cable"),
+         InlineKeyboardButton("آیفون", callback_data=f"{prefix}intercom")],
+        [InlineKeyboardButton("اعلان حریق", callback_data=f"{prefix}fire_alarm"),
+         InlineKeyboardButton("پریز میلو", callback_data=f"{prefix}milo_socket")],
+        [InlineKeyboardButton("پریز ملونی", callback_data=f"{prefix}meloni_socket"),
+         InlineKeyboardButton("کلید هوشمند", callback_data=f"{prefix}smart_switches")],
+        [InlineKeyboardButton("کلید مکانیکی", callback_data=f"{prefix}mechanical_switches")],
+    ])
 
-async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_cmd(update: Update, ctx):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ شما دسترسی ادمین ندارید.")
-        return ConversationHandler.END
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
     await update.message.reply_text(
-        "🔧 پنل مدیریت تلگرام:",
-        reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True),
-    )
-    return ADMIN_MENU
+        "🔧 *پنل مدیریت*\nگزینه مورد نظر:",
+        parse_mode="Markdown", reply_markup=admin_panel_kb())
 
+async def admin_cb(update: Update, ctx):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
 
-async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-
-    if text == "❌ خروج از پنل":
-        await update.message.reply_text("از پنل خارج شدید.", reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True))
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("⛔ دسترسی ندارید.")
         return ConversationHandler.END
 
-    if text == "📤 آپلود PDF / کاتالوگ":
-        cats = [r[0] for r in MAIN_MENU if r[0] not in SUB_MENUS and r[0] != "🛒 ثبت سفارش / تماس با ما"]
-        for items in SUB_MENUS.values():
-            for row in items:
-                if row[0] != "🔙 بازگشت" and row[0] not in cats:
-                    cats.append(row[0])
-        kb = [[c] for c in cats] + [["❌ انصراف"]]
-        await update.message.reply_text("دسته‌بندی مقصد را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-        return UPLOAD_CATEGORY
+    # ── STATS (FIX #8: always return END) ──
+    if data == "adm_stats":
+        s = db.get_stats()
+        counts = db.count_catalogs_by_category()
+        details = "\n".join(f"  • {k}: {v}" for k, v in counts.items()) or "  (خالی)"
+        await q.edit_message_text(
+            f"📊 *آمار ربات*\n\n"
+            f"👥 کاربران: {s['total_users']}\n"
+            f"📁 کل فایل‌ها: {s['total_files']}\n\n"
+            f"📦 *توزیع کاتالوگ‌ها:*\n{details}",
+            parse_mode="Markdown", reply_markup=admin_panel_kb())
+        return ConversationHandler.END
 
-    if text == "🗑️ مدیریت / حذف کاتالوگ":
-        cats = db.get_all_categories()
-        if not cats:
-            await update.message.reply_text("هیچ فایلی موجود نیست.")
-            return ADMIN_MENU
-        kb = [[c] for c in cats] + [["❌ انصراف"]]
-        await update.message.reply_text("دسته‌بندی را انتخاب کنید:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-        return DELETE_SELECT_CAT
-
-    if text == "📞 اطلاعات تماس":
-        current = db.get_setting("contact_text", "تنظیم نشده")
-        await update.message.reply_text(f"متن فعلی:\n\n{current}\n\nمتن جدید را بفرستید یا /cancel")
-        return EDIT_CONTACT
-
-    if text == "📢 پیام همگانی":
-        await update.message.reply_text("متن پیام همگانی را بفرستید یا /cancel")
-        return BROADCAST_MSG
-
-    if text == "📊 آمار":
-        total_users = db.get_user_count()
-        active_users = db.get_active_user_count()
-        total_files = db.get_catalog_count()
-        cat_stats = db.get_category_stats()
-        lines = [
-            "📊 آمار ربات:",
-            f"👥 کل کاربران: {total_users}",
-            f"✅ فعال: {active_users}",
-            f"📁 فایل‌ها: {total_files}",
-            "",
-            "📂 تفکیک:",
-        ]
-        for cs in cat_stats:
-            lines.append(f"  • {cs['category']}: {cs['cnt']}")
-        await update.message.reply_text("\n".join(lines))
-        return ADMIN_MENU
-
-    if text == "💾 دانلود بکاپ":
+    # ── BACKUP ──
+    if data == "adm_backup":
+        if not os.path.exists(db.db_name):
+            await q.edit_message_text("⚠️ فایل دیتابیس یافت نشد.")
+            return ConversationHandler.END
+        await q.edit_message_text("⏳ در حال ساخت بکاپ امن...")
         try:
-            path = f"/tmp/backup_{int(__import__('time').time())}.db"
-            db.backup_to_file(path)
-            with open(path, "rb") as f:
-                await update.message.reply_document(document=f, filename="bot_backup.db", caption="✅ بکاپ")
-            if os.path.exists(path):
-                os.remove(path)
+            backup_path = db.db_name + ".backup"
+            db.backup_to_file(backup_path)
+            with open(backup_path, "rb") as f:
+                await ctx.bot.send_document(
+                    chat_id=q.message.chat_id,
+                    document=f,
+                    filename=f"backup_{__import__('datetime').datetime.now():%Y%m%d_%H%M}.db",
+                    caption="💾 بکاپ دیتابیس ربات (شامل کاتالوگ، کاربران و تنظیمات)")
+            os.remove(backup_path)
+            await q.edit_message_text("✅ بکاپ ارسال شد.", reply_markup=admin_panel_kb())
         except Exception as e:
-            await update.message.reply_text(f"⚠️ خطا: {e}")
-        return ADMIN_MENU
+            logger.error(f"Backup error: {e}")
+            await q.edit_message_text(f"❌ خطا در بکاپ: {e}")
+        return ConversationHandler.END
 
-    if text == "📥 بازگردانی بکاپ":
-        await update.message.reply_text("فایل .db را بفرستید یا /cancel")
+    # ── RESTORE ──
+    if data == "adm_restore":
+        await q.edit_message_text(
+            "📥 فایل بکاپ (`.db`) را ارسال کنید.\n\n"
+            "⚠️ دیتابیس فعلی به‌طور خودکار پشتیبان‌گیری می‌شود.",
+            parse_mode="Markdown")
         return RESTORE_DB
 
-    await update.message.reply_text("گزینه نامعتبر است.")
-    return ADMIN_MENU
+    # ── UPLOAD ──
+    if data == "adm_upload":
+        await q.edit_message_text("📂 انتخاب دسته برای افزودن فایل:", reply_markup=cat_picker_kb("ucat_"))
+        return UPLOAD_CAT
 
+    # ── MANAGE / DELETE ──
+    if data == "adm_manage_pick":
+        await q.edit_message_text("🗂️ انتخاب دسته برای مدیریت:", reply_markup=cat_picker_kb("mcat_"))
+        return MANAGE_CAT
 
-async def upload_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    if text == "❌ انصراف":
-        await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-    context.user_data["upload_category"] = text
-    await update.message.reply_text(
-        f"📂 دسته: {text}\n\nفایل PDF یا عکس را بفرستید:",
-        reply_markup=ReplyKeyboardMarkup([["❌ انصراف"]], resize_keyboard=True),
-    )
-    return UPLOAD_FILE
+    if data.startswith("mcat_"):
+        cat_key = data[5:]
+        files = db.get_catalogs(cat_key)
+        if not files:
+            await q.edit_message_text(
+                "📂 این دسته خالی است.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 بازگشت", callback_data="adm_home")]]))
+            return ConversationHandler.END
+        kb = [
+            [InlineKeyboardButton(
+                f"🗑️ {f['file_name'] or 'فایل #'+str(f['id'])}",
+                callback_data=f"del_{f['id']}")]
+            for f in files
+        ]
+        kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="adm_home")])
+        await q.edit_message_text("🗑️ روی فایل بزنید تا حذف شود:", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
 
+    if data.startswith("del_"):
+        cid = int(data[4:])
+        item = db.get_catalog_by_id(cid)
+        db.delete_catalog(cid)
+        await q.edit_message_text(
+            f"✅ حذف شد: {item['file_name'] if item else cid}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="adm_home")]]))
+        return ConversationHandler.END
 
-async def upload_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.text == "❌ انصراف":
-        await msg.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
+    # ── CONTACT ──
+    if data == "adm_contact":
+        cur = db.get_setting("contact_text", "(خالی)")
+        await q.edit_message_text(
+            f"📝 متن فعلی:\n\n{cur}\n\n──────────\n"
+            "متن جدید را ارسال کنید:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
+        return SET_CONTACT
 
-    if msg.document:
-        context.user_data["file_id"] = msg.document.file_id
-        context.user_data["file_type"] = "document"
-        context.user_data["original_filename"] = msg.document.file_name
-        context.user_data["caption"] = msg.caption or ""
-    elif msg.photo:
-        context.user_data["file_id"] = msg.photo[-1].file_id
-        context.user_data["file_type"] = "photo"
-        context.user_data["original_filename"] = None
-        context.user_data["caption"] = msg.caption or ""
-    else:
-        await msg.reply_text("لطفاً PDF یا عکس بفرستید.")
-        return UPLOAD_FILE
+    # ── BROADCAST ──
+    if data == "adm_broadcast":
+        await q.edit_message_text(
+            "📢 متن پیام همگانی را ارسال کنید:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
+        return BROADCAST
 
-    await msg.reply_text("یادداشت قیمت را بنویسید یا /skip")
-    return UPLOAD_NOTE
+    # ── HOME ──
+    if data == "adm_home":
+        await q.edit_message_text("🔧 *پنل مدیریت*", parse_mode="Markdown",
+                                  reply_markup=admin_panel_kb())
+        return ConversationHandler.END
 
-
-async def upload_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    note = None if text.strip() == "/skip" else text
-    catalog_id = db.add_catalog(
-        category=context.user_data["upload_category"],
-        file_id=context.user_data["file_id"],
-        file_type=context.user_data["file_type"],
-        caption=context.user_data.get("caption"),
-        custom_note=note,
-        uploaded_by=update.effective_user.id,
-        original_filename=context.user_data.get("original_filename"),
-    )
-    await update.message.reply_text(
-        f"✅ فایل #{catalog_id} ذخیره شد.",
-        reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True),
-    )
-    context.user_data.clear()
-    return ADMIN_MENU
-
-
-async def delete_cat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    if text == "❌ انصراف":
-        await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-
-    catalogs = db.get_catalogs(text)
-    if not catalogs:
-        await update.message.reply_text("فایلی یافت نشد.")
-        return ADMIN_MENU
-
-    lines = [f"📂 {text}:", ""]
-    for c in catalogs:
-        fname = c["original_filename"] or c["file_type"]
-        extra = f" — ({c['custom_note']})" if c["custom_note"] else ""
-        lines.append(f"🔹 #{c['id']} — {fname}{extra}")
-    lines.append("")
-    lines.append("ID فایل برای حذف را بفرستید یا /cancel")
-    await update.message.reply_text("\n".join(lines))
-    return DELETE_SELECT_ITEM
-
-
-async def delete_item_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if text == "/cancel":
-        await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-    try:
-        catalog_id = int(text)
-    except ValueError:
-        await update.message.reply_text("یک عدد وارد کنید.")
-        return DELETE_SELECT_ITEM
-
-    cat = db.get_catalog_by_id(catalog_id)
-    if not cat:
-        await update.message.reply_text("فایل یافت نشد.")
-    else:
-        db.delete_catalog(catalog_id)
-        await update.message.reply_text(f"✅ فایل #{catalog_id} حذف شد.")
-
-    await update.message.reply_text("پنل مدیریت:", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-    return ADMIN_MENU
-
-
-async def edit_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    if text.strip() == "/cancel":
-        await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-    db.set_setting("contact_text", text)
-    await update.message.reply_text("✅ اطلاعات تماس ذخیره شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-    return ADMIN_MENU
-
-
-async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    if text.strip() == "/cancel":
-        await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-
-    user_ids = db.get_active_user_ids()
-    sent = failed = 0
-    status = await update.message.reply_text(f"📢 ارسال به {len(user_ids)} کاربر...")
-
-    for uid in user_ids:
-        try:
-            await context.bot.send_message(chat_id=uid, text=text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-
-    db.log_broadcast(text, sent, failed, update.effective_user.id)
-    try:
-        await status.edit_text(f"✅ تمام شد\n✅ {sent}\n❌ {failed}")
-    except Exception:
-        pass
-    await update.message.reply_text("پنل مدیریت:", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-    return ADMIN_MENU
-
-
-async def restore_db_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg.text and msg.text.strip() == "/cancel":
-        await msg.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-        return ADMIN_MENU
-    if not msg.document:
-        await msg.reply_text("فایل .db بفرستید.")
-        return RESTORE_DB
-    try:
-        tg_file = await context.bot.get_file(msg.document.file_id)
-        path = f"/tmp/restore_{int(__import__('time').time())}.db"
-        await tg_file.download_to_drive(path)
-        db.restore_from_file(path)
-        if os.path.exists(path):
-            os.remove(path)
-        await msg.reply_text("✅ بازگردانی انجام شد.", reply_markup=ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True))
-    except Exception as e:
-        await msg.reply_text(f"⚠️ خطا: {e}")
-    return ADMIN_MENU
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("لغو شد.", reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True))
     return ConversationHandler.END
 
+# ── CONVERSATION STATE HANDLERS ──
 
-def create_bot_app():
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    if not token:
-        raise ValueError("BOT_TOKEN is empty")
+async def ucat_select(update: Update, ctx):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return ConversationHandler.END
+    cat_key = q.data[5:]
+    ctx.user_data["upload_cat_key"] = cat_key
+    await q.edit_message_text(f"📄 فایل را ارسال کنید (PDF یا عکس):")
+    return UPLOAD_FILE
 
-    app = (
-        Application.builder()
-        .token(token)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .build()
-    )
+# FIX #7: Support both documents AND photos
+async def upload_file_receive(update: Update, ctx):
+    msg = update.message
+    if msg.document:
+        ctx.user_data["upload_file_id"] = msg.document.file_id
+        ctx.user_data["upload_file_name"] = msg.document.file_name or "document.pdf"
+        ctx.user_data["upload_file_type"] = "document"
+    elif msg.photo:
+        ctx.user_data["upload_file_id"] = msg.photo[-1].file_id
+        ctx.user_data["upload_file_name"] = "photo.jpg"
+        ctx.user_data["upload_file_type"] = "photo"
+    else:
+        await msg.reply_text("⚠️ لطفاً فایل PDF یا عکس ارسال کنید:")
+        return UPLOAD_FILE
 
+    await msg.reply_text(
+        "📝 فایل دریافت شد!\n\n"
+        "اگر توضیحی دارید (مثلاً: «لیست بعلاوه ۲۰ درصد می‌باشد») وارد کنید،\n"
+        "یا عدد `0` را بفرستید:")
+    return UPLOAD_NOTE
+
+async def upload_note_receive(update: Update, ctx):
+    note = update.message.text.strip()
+    if note == "0":
+        note = ""
+    db.add_catalog_file(
+        cat_key=ctx.user_data["upload_cat_key"],
+        title=ctx.user_data["upload_cat_key"],
+        file_id=ctx.user_data["upload_file_id"],
+        file_name=ctx.user_data["upload_file_name"],
+        note=note,
+        file_type=ctx.user_data["upload_file_type"])
+    await update.message.reply_text(
+        "✅ فایل با موفقیت ذخیره و به دکمه متصل شد!",
+        reply_markup=main_menu_kb())
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+async def restore_db_receive(update: Update, ctx):
+    msg = update.message
+    if not msg.document:
+        await msg.reply_text("⚠️ فایل را به صورت Document ارسال کنید:")
+        return RESTORE_DB
+    if not (msg.document.file_name or "").endswith(".db"):
+        await msg.reply_text("⚠️ فایل باید با پسوند `.db` باشد.")
+        return RESTORE_DB
+
+    await msg.reply_text("⏳ دانلود و اعتبارسنجی فایل...")
+    tmp_path = "restore_tmp.db"
+    try:
+        file = await ctx.bot.get_file(msg.document.file_id)
+        await file.download_to_drive(custom_path=tmp_path)
+        if not db.restore_from_file(tmp_path):
+            raise ValueError("فایل دیتابیس معتبر نیست")
+        os.remove(tmp_path)
+        await msg.reply_text(
+            "✅ دیتابیس با موفقیت بازگردانی شد!",
+            reply_markup=main_menu_kb())
+    except Exception as e:
+        logger.error(f"Restore fail: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await msg.reply_text(f"❌ بازگردانی ناموفق: {e}")
+    return ConversationHandler.END
+
+async def set_contact_receive(update: Update, ctx):
+    db.set_setting("contact_text", update.message.text)
+    await update.message.reply_text("✅ متن تماس بروزرسانی شد.", reply_markup=main_menu_kb())
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+async def broadcast_receive(update: Update, ctx):
+    msg = update.message.text
+    users = db.get_all_users()
+    await update.message.reply_text(f"⏳ ارسال به {len(users)} کاربر...")
+    ok = fail = 0
+    for u in users:
+        try:
+            await ctx.bot.send_message(u["user_id"], msg[:4000])
+            ok += 1
+        except Exception:
+            fail += 1
+    await update.message.reply_text(
+        f"✅ گزارش ارسال:\n├ موفق: {ok}\n└ ناموفق: {fail}",
+        reply_markup=main_menu_kb())
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_state(update: Update, ctx):
+    """Fallback cancel from callbacks or text."""
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("❌ لغو شد.")
+    elif update.message:
+        await update.message.reply_text("❌ لغو شد.", reply_markup=main_menu_kb())
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+# ── MAIN ──
+
+def main():
+    if not TOKEN:
+        logger.error("❌ BOT_TOKEN missing!")
+        return
+
+    app = Application.builder().token(TOKEN).build()
+
+    # FIX #2: admin_nav lets users escape any state
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_start)],
+        entry_points=[CallbackQueryHandler(admin_cb, pattern="^adm_")],
         states={
-            ADMIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_handler)],
-            UPLOAD_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, upload_category_handler)],
-            UPLOAD_FILE: [
-                MessageHandler(filters.Document.ALL | filters.PHOTO, upload_file_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, upload_file_handler),
+            UPLOAD_CAT: [
+                CallbackQueryHandler(ucat_select, pattern="^ucat_"),
+                CallbackQueryHandler(admin_cb, pattern="^adm_"),
             ],
-            UPLOAD_NOTE: [MessageHandler(filters.TEXT, upload_note_handler)],
-            DELETE_SELECT_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_cat_handler)],
-            DELETE_SELECT_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item_handler)],
-            EDIT_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_contact_handler)],
-            BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_handler)],
+            UPLOAD_FILE: [
+                MessageHandler(filters.Document.ALL | filters.PHOTO, upload_file_receive),
+                CallbackQueryHandler(admin_cb, pattern="^adm_"),
+                CommandHandler("cancel", cancel_state),
+            ],
+            UPLOAD_NOTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, upload_note_receive),
+                CommandHandler("cancel", cancel_state),
+            ],
+            MANAGE_CAT: [
+                CallbackQueryHandler(admin_cb, pattern="^mcat_|^adm_"),
+            ],
             RESTORE_DB: [
-                MessageHandler(filters.Document.ALL, restore_db_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, restore_db_handler),
+                MessageHandler(filters.Document.ALL, restore_db_receive),
+                CallbackQueryHandler(admin_cb, pattern="^adm_"),
+                CommandHandler("cancel", cancel_state),
+            ],
+            SET_CONTACT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive),
+                CallbackQueryHandler(admin_cb, pattern="^adm_"),
+                CommandHandler("cancel", cancel_state),
+            ],
+            BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive),
+                CallbackQueryHandler(admin_cb, pattern="^adm_"),
+                CommandHandler("cancel", cancel_state),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
+        fallbacks=[
+            CommandHandler("cancel", cancel_state),
+            CommandHandler("start", start),
+        ],
+        per_message=False,
     )
 
-    app.add_handler(admin_conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex(BUTTON_REGEX), handle_menu))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(admin_conv)
+    # FIX #4: only match real button texts
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(BUTTON_REGEX),
+        handle_message))
 
-    # unknown text fallback so users get a reply
-    async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "لطفاً از منوی زیر یک گزینه را انتخاب کنید:",
-            reply_markup=ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True),
-        )
+    logger.info("🤖 Tavansazeh bot is live...")
+    app.run_polling(drop_pending_updates=True)
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
-    return app
+if __name__ == "__main__":
+    main()
