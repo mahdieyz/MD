@@ -1,208 +1,139 @@
-import sqlite3
-import os
-import threading
-import shutil
-import logging
+import os, json, sqlite3, shutil, logging
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 class Database:
-    _local = threading.local()
-
-    def __init__(self, db_path=None):
-        self.db_path = db_path or os.environ.get("DB_PATH", "bot_database.db")
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir:
+    def __init__(self):
+        self.db_name = DB_PATH
+        # FIX #1: Ensure parent directory exists (needed for Railway Volume)
+        db_dir = os.path.dirname(self.db_name)
+        if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
-        self._init_db()
+            logging.info(f"📁 Created DB directory: {db_dir}")
+        self.init_db()
 
-    def _get_conn(self):
-        if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout=5000;")
-            self._local.conn = conn
-        return self._local.conn
+    def conn(self):
+        c = sqlite3.connect(self.db_name)
+        c.row_factory = sqlite3.Row
+        return c
 
-    def _init_db(self):
-        conn = self._get_conn()
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_blocked INTEGER DEFAULT 0
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS catalogs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            file_type TEXT DEFAULT 'document',
-            caption TEXT,
-            custom_note TEXT,
-            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            uploaded_by INTEGER,
-            original_filename TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_text TEXT,
-            sent_count INTEGER,
-            fail_count INTEGER,
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            sent_by INTEGER
-        )""")
-        conn.commit()
+    def init_db(self):
+        c = self.conn()
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY, username TEXT,
+                first_name TEXT, last_name TEXT,
+                join_date TEXT, last_activity TEXT
+            );
+            CREATE TABLE IF NOT EXISTS catalogs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_key TEXT,
+                title TEXT,
+                file_id TEXT,
+                file_name TEXT,
+                file_type TEXT DEFAULT 'document',
+                note TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT
+            );
+        """)
+        c.commit(); c.close()
 
-    def register_user(self, user_id, username=None, first_name=None, last_name=None):
-        conn = self._get_conn()
-        c = conn.cursor()
-        c.execute("""INSERT INTO users (user_id, username, first_name, last_name)
-                     VALUES (?, ?, ?, ?)
-                     ON CONFLICT(user_id) DO UPDATE SET
-                     username=excluded.username,
-                     first_name=excluded.first_name,
-                     last_name=excluded.last_name,
-                     last_active=CURRENT_TIMESTAMP""",
-                  (user_id, username, first_name, last_name))
-        conn.commit()
+    # ── USERS ──
+    def add_user(self, uid, uname, fname, lname):
+        conn = self.conn()
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO users (user_id,username,first_name,last_name,join_date,last_activity) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "username=excluded.username, first_name=excluded.first_name, "
+            "last_name=excluded.last_name, last_activity=excluded.last_activity",
+            (uid, uname, fname, lname, now, now))
+        conn.commit(); conn.close()
 
     def get_all_users(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT * FROM users ORDER BY last_active DESC").fetchall()
+        c = self.conn()
+        rows = [dict(r) for r in c.execute("SELECT * FROM users").fetchall()]
+        c.close(); return rows
 
-    def get_active_user_ids(self):
-        conn = self._get_conn()
-        rows = conn.execute("SELECT user_id FROM users WHERE is_blocked = 0").fetchall()
-        return [r['user_id'] for r in rows]
+    # ── CATALOGS ──
+    def add_catalog_file(self, cat_key, title, file_id, file_name="", note="", file_type="document"):
+        c = self.conn()
+        c.execute(
+            "INSERT INTO catalogs (category_key, title, file_id, file_name, file_type, note, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (cat_key, title, file_id, file_name, file_type, note, datetime.now().isoformat()))
+        c.commit(); c.close()
 
-    def get_user_count(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) as cnt FROM users").fetchone()['cnt']
+    def get_catalogs(self, cat_key):
+        c = self.conn()
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM catalogs WHERE category_key=? ORDER BY id ASC", (cat_key,)).fetchall()]
+        c.close(); return rows
 
-    def get_active_user_count(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) as cnt FROM users WHERE is_blocked = 0").fetchone()['cnt']
+    def get_catalog_by_id(self, cat_id):
+        c = self.conn()
+        r = c.execute("SELECT * FROM catalogs WHERE id=?", (cat_id,)).fetchone()
+        c.close(); return dict(r) if r else None
 
-    def block_user(self, user_id):
-        conn = self._get_conn()
-        conn.execute("UPDATE users SET is_blocked = 1 WHERE user_id = ?", (user_id,))
-        conn.commit()
+    def delete_catalog(self, cat_id):
+        c = self.conn()
+        c.execute("DELETE FROM catalogs WHERE id=?", (cat_id,))
+        c.commit(); c.close()
 
-    def unblock_user(self, user_id):
-        conn = self._get_conn()
-        conn.execute("UPDATE users SET is_blocked = 0 WHERE user_id = ?", (user_id,))
-        conn.commit()
+    def count_catalogs_by_category(self):
+        c = self.conn()
+        rows = c.execute(
+            "SELECT category_key, COUNT(*) as cnt FROM catalogs GROUP BY category_key"
+        ).fetchall()
+        c.close(); return {r["category_key"]: r["cnt"] for r in rows}
 
-    def add_catalog(self, category, file_id, file_type='document', caption=None, custom_note=None, uploaded_by=None, original_filename=None):
-        conn = self._get_conn()
-        c = conn.cursor()
-        c.execute("""INSERT INTO catalogs (category, file_id, file_type, caption, custom_note, uploaded_by, original_filename)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                  (category, file_id, file_type, caption, custom_note, uploaded_by, original_filename))
-        conn.commit()
-        return c.lastrowid
+    # ── SETTINGS ──
+    def set_setting(self, key, val):
+        c = self.conn()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, val))
+        c.commit(); c.close()
 
-    def get_catalogs(self, category=None):
-        conn = self._get_conn()
-        if category:
-            return conn.execute("SELECT * FROM catalogs WHERE category = ? ORDER BY uploaded_at DESC", (category,)).fetchall()
-        return conn.execute("SELECT * FROM catalogs ORDER BY uploaded_at DESC").fetchall()
+    def get_setting(self, key, default=""):
+        c = self.conn()
+        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        c.close(); return r["value"] if r else default
 
-    def get_catalog_by_id(self, catalog_id):
-        conn = self._get_conn()
-        return conn.execute("SELECT * FROM catalogs WHERE id = ?", (catalog_id,)).fetchone()
+    # ── STATS ──
+    def get_stats(self):
+        c = self.conn()
+        u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        f = c.execute("SELECT COUNT(*) FROM catalogs").fetchone()[0]
+        c.close()
+        return {"total_users": u, "total_files": f}
 
-    def delete_catalog(self, catalog_id):
-        conn = self._get_conn()
-        conn.execute("DELETE FROM catalogs WHERE id = ?", (catalog_id,))
-        conn.commit()
+    # ── BACKUP / RESTORE ──
+    def backup_to_file(self, target_path):
+        """Safe backup using SQLite's online backup API."""
+        src = sqlite3.connect(self.db_name)
+        dst = sqlite3.connect(target_path)
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        return target_path
 
-    def update_catalog_note(self, catalog_id, note):
-        conn = self._get_conn()
-        conn.execute("UPDATE catalogs SET custom_note = ? WHERE id = ?", (note, catalog_id))
-        conn.commit()
-
-    def get_catalog_count(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) as cnt FROM catalogs").fetchone()['cnt']
-
-    def get_category_stats(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT category, COUNT(*) as cnt FROM catalogs GROUP BY category ORDER BY cnt DESC").fetchall()
-
-    def set_setting(self, key, value):
-        conn = self._get_conn()
-        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (key, value))
-        conn.commit()
-
-    def get_setting(self, key, default=None):
-        conn = self._get_conn()
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row['value'] if row else default
-
-    def get_all_settings(self):
-        conn = self._get_conn()
-        return conn.execute("SELECT * FROM settings ORDER BY key").fetchall()
-
-    def log_broadcast(self, message_text, sent_count, fail_count, sent_by=None):
-        conn = self._get_conn()
-        conn.execute("""INSERT INTO broadcast_log (message_text, sent_count, fail_count, sent_by)
-                        VALUES (?, ?, ?, ?)""",
-                     (message_text, sent_count, fail_count, sent_by))
-        conn.commit()
-
-    def get_broadcast_logs(self, limit=50):
-        conn = self._get_conn()
-        return conn.execute("SELECT * FROM broadcast_log ORDER BY sent_at DESC LIMIT ?", (limit,)).fetchall()
-
-    def backup_to_file(self, backup_path):
-        conn = self._get_conn()
-        backup_dir = os.path.dirname(backup_path)
-        if backup_dir:
-            os.makedirs(backup_dir, exist_ok=True)
-        backup_conn = sqlite3.connect(backup_path)
-        conn.backup(backup_conn)
-        backup_conn.close()
-        return backup_path
-
-    def restore_from_file(self, restore_path):
-        test_conn = sqlite3.connect(restore_path)
+    def restore_from_file(self, source_path):
+        """Validate and restore from a .db file. Returns True on success."""
         try:
-            tables = test_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            table_names = [t[0] for t in tables]
-            required = ['users', 'catalogs', 'settings']
-            for req in required:
-                if req not in table_names:
-                    raise ValueError(f"جدول {req} یافت نشد.")
-        finally:
-            test_conn.close()
-
-        if hasattr(self._local, 'conn') and self._local.conn:
-            try:
-                self._local.conn.close()
-            except Exception:
-                pass
-            self._local.conn = None
-
-        pre_backup = self.db_path + '.pre_restore_backup'
-        if os.path.exists(self.db_path):
-            shutil.copy2(self.db_path, pre_backup)
-
-        shutil.copy2(restore_path, self.db_path)
-        self._init_db()
-        return True
-
-    def get_all_categories(self):
-        conn = self._get_conn()
-        rows = conn.execute("SELECT DISTINCT category FROM catalogs ORDER BY category").fetchall()
-        return [r['category'] for r in rows]
+            # FIX #6: Validate it's a real SQLite DB
+            test = sqlite3.connect(source_path)
+            test.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            test.close()
+            # Backup current, then replace
+            if os.path.exists(self.db_name):
+                self.backup_to_file(self.db_name + ".pre_restore_backup")
+            shutil.copy2(source_path, self.db_name)
+            return True
+        except Exception as e:
+            logging.error(f"Restore failed: {e}")
+            return False
