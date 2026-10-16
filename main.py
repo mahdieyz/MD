@@ -1,8 +1,15 @@
 import os
 import threading
+import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import database
 from bot import create_bot_app
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -10,20 +17,31 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
+        
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        
     def log_message(self, format, *args):
         return
 
 def run_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    server.serve_forever()
+    try:
+        port = int(os.getenv("PORT", 8080))
+        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        logger.info(f"Health check server listening on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
 
 if __name__ == "__main__":
+    logger.info("Initializing database...")
     database.init_db()
     
-    # سرور سبک جهت پاسخ به پورت Railway
+    logger.info("Starting health server thread...")
     threading.Thread(target=run_health_server, daemon=True).start()
     
-    print("🚀 Bot is launching...")
+    logger.info("Starting Telegram bot polling...")
     bot_app = create_bot_app()
     bot_app.run_polling(drop_pending_updates=True)
