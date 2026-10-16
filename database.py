@@ -1,20 +1,20 @@
 import sqlite3
 import os
+import logging
 
+logger = logging.getLogger(__name__)
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
-
-def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
         
+    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -81,12 +81,12 @@ def reset_bot_config():
         return True
     except Exception as e:
         conn.rollback()
-        print(f"Database Reset Error: {e}")
+        logger.error(f"Database Reset Error: {e}")
         return False
     finally:
         conn.close()
 
-# --- مدیریت کاربران ---
+# --- کاربرها ---
 def add_user(user_id, username, full_name):
     conn = get_db_connection()
     conn.execute('''
@@ -111,7 +111,7 @@ def get_user_count():
     conn.close()
     return count
 
-# --- مدیریت دکمه‌ها و کاتالوگ‌ها ---
+# --- دکمه‌ها و کاتالوگ‌ها ---
 def get_buttons(parent_id=0, admin_mode=False):
     conn = get_db_connection()
     if admin_mode:
@@ -135,7 +135,7 @@ def add_menu_button(title, parent_id=0):
     conn.close()
 
 def delete_button(button_id):
-    """حذف بازگشتی دکمه و تمامی زیرمنوها و فایل‌های آن"""
+    """حذف بازگشتی دکمه و زیرمنوهای آن"""
     conn = get_db_connection()
     cursor = conn.cursor()
     
