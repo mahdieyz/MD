@@ -13,15 +13,15 @@ db = Database()
 TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
 
-(UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, BROADCAST, 
- RESTORE_DB, MANAGE_CAT, EDIT_BTN) = range(8)
+# تعریف مراحل مکالمه ادمین
+(UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, SET_WELCOME, 
+ BROADCAST, RESTORE_DB, MANAGE_CAT, EDIT_BTN) = range(9)
 
 def is_admin(uid):
     return uid in ADMIN_IDS
 
 # ── DYNAMIC BUTTON SYSTEM ──
 
-# Default text for buttons
 DEFAULT_BUTTONS = {
     "btn_magnetar": "مگنتار و چراغ لاینی",
     "btn_switches_main": "کلید ، پریز هوشمند و مکانیکی",
@@ -41,7 +41,6 @@ DEFAULT_BUTTONS = {
     "btn_back": "بازگشت به منوی اصلی"
 }
 
-# Link button IDs to internal database category keys for PDFs
 CAT_KEYS = {
     "btn_magnetar": "magnetar_line",
     "btn_industrial": "industrial",
@@ -57,7 +56,6 @@ CAT_KEYS = {
     "btn_mech": "mechanical_switches"
 }
 
-# Keyboard Layouts
 LAYOUT_MAIN = [
     ["btn_magnetar", "btn_switches_main"],
     ["btn_industrial", "btn_facade_main"],
@@ -69,11 +67,9 @@ LAYOUT_FACADE = [["btn_mod_noor", "btn_shaa", "btn_anvar"], ["btn_back"]]
 LAYOUT_SWITCHES = [["btn_smart", "btn_mech"], ["btn_back"]]
 
 def get_btn(key):
-    """Fetch the custom name. If hidden, returns 'HIDDEN'"""
     return db.get_setting(key, DEFAULT_BUTTONS.get(key, ""))
 
 def build_reply_kb(layout_matrix):
-    """Dynamically builds a Telegram keyboard, skipping deleted/hidden buttons."""
     kb = []
     for row in layout_matrix:
         kb_row = []
@@ -81,11 +77,9 @@ def build_reply_kb(layout_matrix):
             text = get_btn(key)
             if text and text != "HIDDEN":
                 kb_row.append(KeyboardButton(text))
-        if kb_row:  # Only add row if it's not empty
+        if kb_row:
             kb.append(kb_row)
-    
     if not kb:
-        # Failsafe if everything is deleted
         return ReplyKeyboardMarkup([[KeyboardButton("/start")]], resize_keyboard=True)
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
@@ -93,46 +87,36 @@ def build_reply_kb(layout_matrix):
 
 def admin_panel_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 آپلود PDF / عکس", callback_data="adm_upload")],
-        [InlineKeyboardButton("🗑️ مدیریت فایل‌ها", callback_data="adm_manage_pick"),
-         InlineKeyboardButton("📞 متن تماس", callback_data="adm_contact")],
+        [InlineKeyboardButton("📤 آپلود فایل", callback_data="adm_upload"),
+         InlineKeyboardButton("🗑️ مدیریت فایل‌ها", callback_data="adm_manage_pick")],
         [InlineKeyboardButton("✏️ تغییر نام دکمه", callback_data="adm_edit_btns"),
          InlineKeyboardButton("👁️‍🗨️ مخفی/حذف دکمه", callback_data="adm_hide_btns")],
-        [InlineKeyboardButton("💾 بکاپ گیری", callback_data="adm_backup"),
-         InlineKeyboardButton("📥 بازگردانی بکاپ", callback_data="adm_restore")],
+        [InlineKeyboardButton("📞 متن تماس", callback_data="adm_contact"),
+         InlineKeyboardButton("👋 پیام شروع", callback_data="adm_welcome")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"),
-         InlineKeyboardButton("📊 آمار", callback_data="adm_stats")]
+         InlineKeyboardButton("📊 آمار ربات", callback_data="adm_stats")],
+        [InlineKeyboardButton("💾 بکاپ گیری", callback_data="adm_backup"),
+         InlineKeyboardButton("📥 بازگردانی", callback_data="adm_restore")]
     ])
 
 def dynamic_picker_kb(prefix, mode="cats_only"):
-    """
-    mode='cats_only' -> For Upload/Manage (only shows categories in CAT_KEYS)
-    mode='all' -> For Renaming (shows everything so you can unhide)
-    mode='hide' -> For Hiding (shows everything currently visible except back btn)
-    """
     kb = []
     row = []
-    
     keys_to_iterate = CAT_KEYS.keys() if mode == "cats_only" else DEFAULT_BUTTONS.keys()
     
     for key in keys_to_iterate:
-        if mode == "hide" and key == "btn_back":
-            continue # Don't allow hiding the back button
-
+        if mode == "hide" and key == "btn_back": continue
         current_name = get_btn(key)
-        
-        if mode == "hide" and current_name == "HIDDEN":
-            continue # Already hidden
+        if mode == "hide" and current_name == "HIDDEN": continue
             
         display_text = current_name[:25] if current_name != "HIDDEN" else f"(مخفی) {DEFAULT_BUTTONS[key][:15]}"
-        
         row.append(InlineKeyboardButton(display_text, callback_data=f"{prefix}{key}"))
+        
         if len(row) == 2:
             kb.append(row)
             row = []
     
-    if row:
-        kb.append(row)
+    if row: kb.append(row)
     kb.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="adm_home")])
     return InlineKeyboardMarkup(kb)
 
@@ -143,10 +127,13 @@ async def start(update: Update, ctx):
     u = update.effective_user
     db.add_user(u.id, u.username, u.first_name, u.last_name)
     template = db.get_setting("welcome_text")
-    welcome = template.replace("{name}", u.first_name or "کاربر") if template else (
-        f"سلام {u.first_name or 'کاربر'} عزیز! 👋\n"
-        "به ربات توان سازه خوش آمدید.\nجهت دریافت کاتالوگ، از منوی زیر استفاده کنید:"
-    )
+    
+    if template:
+        welcome = template.replace("{name}", u.first_name or "کاربر")
+    else:
+        welcome = (f"سلام {u.first_name or 'کاربر'} عزیز! 👋\n"
+                   "به ربات توان سازه خوش آمدید.\nجهت دریافت کاتالوگ، از منوی زیر استفاده کنید:")
+                   
     await update.message.reply_text(welcome, reply_markup=build_reply_kb(LAYOUT_MAIN))
 
 async def cancel_cmd(update: Update, ctx):
@@ -160,7 +147,6 @@ async def handle_message(update: Update, ctx):
     text = update.message.text
     chat_id = update.effective_chat.id
 
-    # 1. Match the user's text to a button key
     matched_key = None
     for k in DEFAULT_BUTTONS.keys():
         btn_text = get_btn(k)
@@ -168,28 +154,22 @@ async def handle_message(update: Update, ctx):
             matched_key = k
             break
 
-    if not matched_key:
-        return # Ignore random text
+    if not matched_key: return 
 
-    # 2. Handle Menu Navigation
     if matched_key == "btn_back":
         await update.message.reply_text("منوی اصلی 👇", reply_markup=build_reply_kb(LAYOUT_MAIN))
         return
-
     if matched_key == "btn_facade_main":
         await update.message.reply_text("برند مورد نظر را انتخاب کنید:", reply_markup=build_reply_kb(LAYOUT_FACADE))
         return
-
     if matched_key == "btn_switches_main":
         await update.message.reply_text("دسته‌بندی را انتخاب کنید:", reply_markup=build_reply_kb(LAYOUT_SWITCHES))
         return
-
     if matched_key == "btn_contact":
         contact = db.get_setting("contact_text", "📞 *ارتباط با فروش*\n\n📲 تلفن: 021-12345678\n👤 پشتیبانی: @Admin")
         await update.message.reply_text(contact, parse_mode="Markdown", reply_markup=build_reply_kb(LAYOUT_MAIN))
         return
 
-    # 3. Handle Catalog Requests
     if matched_key in CAT_KEYS:
         cat_key = CAT_KEYS[matched_key]
         files = db.get_catalogs(cat_key)
@@ -226,9 +206,7 @@ async def admin_cb(update: Update, ctx):
     await q.answer()
     data = q.data
 
-    if not is_admin(q.from_user.id):
-        return ConversationHandler.END
-
+    if not is_admin(q.from_user.id): return ConversationHandler.END
     if data == "adm_home":
         await q.edit_message_text("🔧 *پنل مدیریت*", parse_mode="Markdown", reply_markup=admin_panel_kb())
         return ConversationHandler.END
@@ -256,14 +234,12 @@ async def admin_cb(update: Update, ctx):
         await q.edit_message_text("👁️‍🗨️ دکمه‌ای که می‌خواهید مخفی/حذف شود را انتخاب کنید:", reply_markup=dynamic_picker_kb("hbtn_", "hide"))
         return ConversationHandler.END
 
-    # Handle actual Hide action
     if data.startswith("hbtn_"):
         btn_key = data[5:]
         db.set_setting(btn_key, "HIDDEN")
-        await q.edit_message_text(f"✅ دکمه با موفقیت مخفی شد.\nکاربران دیگر آن را نمی‌بینند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="adm_home")]]))
+        await q.edit_message_text(f"✅ دکمه مخفی شد.\nکاربران دیگر آن را نمی‌بینند.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="adm_home")]]))
         return ConversationHandler.END
 
-    # Handle actual Edit action start
     if data.startswith("ebtn_"):
         btn_key = data[5:]
         ctx.user_data["edit_btn_key"] = btn_key
@@ -271,7 +247,6 @@ async def admin_cb(update: Update, ctx):
         await q.edit_message_text(f"✏️ نام فعلی: «{cur_name}»\n\nنام جدید را تایپ و ارسال کنید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
         return EDIT_BTN
 
-    # Handle Manage Category File selection
     if data.startswith("mcat_"):
         btn_key = data[5:]
         cat_key = CAT_KEYS.get(btn_key)
@@ -292,8 +267,13 @@ async def admin_cb(update: Update, ctx):
 
     if data == "adm_contact":
         cur = db.get_setting("contact_text", "(خالی)")
-        await q.edit_message_text(f"📝 متن فعلی:\n\n{cur}\n\n────────\nمتن جدید را بفرستید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
+        await q.edit_message_text(f"📝 متن فعلی تماس:\n\n{cur}\n\n────────\nمتن جدید را بفرستید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
         return SET_CONTACT
+
+    if data == "adm_welcome":
+        cur = db.get_setting("welcome_text", "(پیش‌فرض)")
+        await q.edit_message_text(f"👋 متن خوش‌آمدگویی فعلی:\n\n{cur}\n\n────────\nمتن جدید را بفرستید.\n(می‌توانید از کلمه `{{name}}` برای نمایش نام کاربر استفاده کنید)", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
+        return SET_WELCOME
 
     if data == "adm_broadcast":
         await q.edit_message_text("📢 متن پیام همگانی را بفرستید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_home")]]))
@@ -318,7 +298,7 @@ async def admin_cb(update: Update, ctx):
 
     return ConversationHandler.END
 
-# ── STATE RECEIVERS ──
+# ── STATE RECEIVERS (TEXT/FILE HANDLERS) ──
 
 async def ucat_select(update: Update, ctx):
     q = update.callback_query
@@ -338,7 +318,6 @@ async def upload_file_receive(update: Update, ctx):
     else:
         await msg.reply_text("⚠️ لطفاً فقط فایل PDF یا عکس بفرستید:")
         return UPLOAD_FILE
-
     await msg.reply_text("📝 دریافت شد! توضیح یا قیمت را تایپ کنید (یا عدد 0 برای بدون متن):")
     return UPLOAD_NOTE
 
@@ -363,7 +342,12 @@ async def edit_btn_receive(update: Update, ctx):
 
 async def set_contact_receive(update: Update, ctx):
     db.set_setting("contact_text", update.message.text)
-    await update.message.reply_text("✅ متن بروزرسانی شد.", reply_markup=build_reply_kb(LAYOUT_MAIN))
+    await update.message.reply_text("✅ متن تماس بروزرسانی شد.", reply_markup=build_reply_kb(LAYOUT_MAIN))
+    return ConversationHandler.END
+
+async def set_welcome_receive(update: Update, ctx):
+    db.set_setting("welcome_text", update.message.text)
+    await update.message.reply_text("✅ پیام خوش‌آمدگویی بروزرسانی شد.", reply_markup=build_reply_kb(LAYOUT_MAIN))
     return ConversationHandler.END
 
 async def broadcast_receive(update: Update, ctx):
@@ -424,6 +408,7 @@ def main():
             MANAGE_CAT: [CallbackQueryHandler(admin_cb, pattern="^mcat_")],
             RESTORE_DB: [MessageHandler(filters.Document.ALL, restore_db_receive)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
+            SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive)],
             EDIT_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_btn_receive)],
         },
