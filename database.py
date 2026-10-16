@@ -1,316 +1,416 @@
-import os, shutil, logging, sqlite3
+import os
+import sqlite3
+import shutil
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
-DB_PATH = os.getenv("DB_PATH", "bot_database.db")
+DB_PATH = os.getenv("DB_PATH", "data/bot.db")
 
 
 class Database:
     def __init__(self):
-        self.db_name = DB_PATH
-        db_dir = os.path.dirname(self.db_name)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            logging.info(f"📁 Created DB directory: {db_dir}")
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
         self.init_db()
 
     def conn(self):
-        c = sqlite3.connect(self.db_name)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL;")
-        return c
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
-    # --- helpers ---
-    def _table_exists(self, c, name):
-        return c.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        ).fetchone() is not None
+    # ---------- schema helpers ----------
+    def _table_exists(self, cur, table):
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        return cur.fetchone() is not None
 
-    def _column_exists(self, c, table, col):
-        info = c.execute(f"PRAGMA table_info({table})").fetchall()
-        return any(r["name"] == col for r in info)
+    def _column_exists(self, cur, table, column):
+        cur.execute(f"PRAGMA table_info({table})")
+        return any(row[1] == column for row in cur.fetchall())
 
-    # --- schema + migration (safe to call again after a restore) ---
+    # ---------- init / migration ----------
     def init_db(self):
-        c = self.conn()
-        c.executescript("""
+        conn = self.conn()
+        cur = conn.cursor()
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, username TEXT,
-                first_name TEXT, last_name TEXT,
-                join_date TEXT, last_activity TEXT
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY, value TEXT
-            );
-            CREATE TABLE IF NOT EXISTS menu_buttons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                parent_id INTEGER DEFAULT 0,
-                title TEXT NOT NULL,
-                order_index INTEGER DEFAULT 0,
-                legacy_key TEXT
-            );
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """)
 
-        if not self._table_exists(c, "catalogs"):
-            c.execute("""
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS menu_buttons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                parent_id INTEGER NOT NULL DEFAULT 0,
+                legacy_key TEXT,
+                order_index INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # catalogs table: create fresh or migrate old schema
+        if not self._table_exists(cur, "catalogs"):
+            cur.execute("""
                 CREATE TABLE catalogs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    button_id INTEGER,
-                    category_key TEXT,
-                    title TEXT,
-                    file_id TEXT,
+                    button_id INTEGER NOT NULL DEFAULT 0,
+                    file_id TEXT NOT NULL,
                     file_name TEXT,
-                    file_type TEXT DEFAULT 'document',
                     note TEXT,
-                    created_at TEXT
+                    file_type TEXT NOT NULL DEFAULT 'document',
+                    category_key TEXT,
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
         else:
-            if not self._column_exists(c, "catalogs", "button_id"):
-                c.execute("ALTER TABLE catalogs ADD COLUMN button_id INTEGER")
-            if not self._column_exists(c, "catalogs", "file_type"):
-                c.execute("ALTER TABLE catalogs ADD COLUMN file_type TEXT DEFAULT 'document'")
+            if not self._column_exists(cur, "catalogs", "button_id"):
+                cur.execute("ALTER TABLE catalogs ADD COLUMN button_id INTEGER NOT NULL DEFAULT 0")
+            if not self._column_exists(cur, "catalogs", "file_type"):
+                cur.execute("ALTER TABLE catalogs ADD COLUMN file_type TEXT NOT NULL DEFAULT 'document'")
+            if not self._column_exists(cur, "catalogs", "category_key"):
+                cur.execute("ALTER TABLE catalogs ADD COLUMN category_key TEXT")
+            if not self._column_exists(cur, "catalogs", "note"):
+                cur.execute("ALTER TABLE catalogs ADD COLUMN note TEXT")
 
-        c.commit()
-        self._seed_defaults(c)
+        conn.commit()
 
-        # انتقال فایل‌های قدیمی که فقط با category_key متنی ذخیره شده بودند
-        if self._column_exists(c, "catalogs", "category_key"):
-            rows = c.execute(
-                "SELECT id, category_key FROM catalogs WHERE button_id IS NULL AND category_key IS NOT NULL"
-            ).fetchall()
-            for r in rows:
-                btn = c.execute(
-                    "SELECT id FROM menu_buttons WHERE legacy_key=?", (r["category_key"],)
-                ).fetchone()
-                if btn:
-                    c.execute("UPDATE catalogs SET button_id=? WHERE id=?", (btn["id"], r["id"]))
+        self._seed_defaults(conn)
+        self._migrate_legacy_catalogs(conn)
 
-        c.commit()
-        c.close()
+        conn.commit()
+        conn.close()
 
-    def _seed_defaults(self, c):
-        count = c.execute("SELECT COUNT(*) FROM menu_buttons").fetchone()[0]
-        if count > 0:
+    def _seed_defaults(self, conn):
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM menu_buttons")
+        if cur.fetchone()[0] > 0:
+            return  # already seeded, never re-seed
+
+        def ins(title, parent_id, legacy_key, order_index):
+            cur.execute(
+                "INSERT INTO menu_buttons (title, parent_id, legacy_key, order_index) VALUES (?, ?, ?, ?)",
+                (title, parent_id, legacy_key, order_index),
+            )
+            return cur.lastrowid
+
+        idx = 0
+
+        ins("مگنتار و چراغ لاینی", 0, "magnetar_line", idx); idx += 1
+
+        smart_group_id = ins("کلید ، پریز هوشمند و مکانیکی", 0, None, idx); idx += 1
+        ins("پریز و کلید هوشمند", smart_group_id, "smart_switches", 0)
+        ins("کلید مکانیکی", smart_group_id, "mechanical_switches", 1)
+
+        ins("صنعتی ساختمانی", 0, "industrial", idx); idx += 1
+
+        facade_group_id = ins("نمای ساختمان - محوطه - استخری", 0, None, idx); idx += 1
+        ins("مد نور", facade_group_id, "mod_noor", 0)
+        ins("شعاع", facade_group_id, "shaa", 1)
+        ins("انوار", facade_group_id, "anvar", 2)
+
+        ins("سیم و کابل", 0, "wire_cable", idx); idx += 1
+        ins("آیفون", 0, "intercom", idx); idx += 1
+        ins("اعلان حریق", 0, "fire_alarm", idx); idx += 1
+        ins("پریز کابینتی میلو", 0, "milo_socket", idx); idx += 1
+        ins("پریز کابینتی ملونی", 0, "meloni_socket", idx); idx += 1
+
+        conn.commit()
+
+    def _migrate_legacy_catalogs(self, conn):
+        cur = conn.cursor()
+        if not self._column_exists(cur, "catalogs", "category_key"):
             return
 
-        def ins(title, parent_id, legacy_key=None, order_index=0):
-            c.execute(
-                "INSERT INTO menu_buttons (parent_id, title, order_index, legacy_key) VALUES (?,?,?,?)",
-                (parent_id, title, order_index, legacy_key),
-            )
-            return c.lastrowid
+        cur.execute(
+            "SELECT id, category_key FROM catalogs "
+            "WHERE category_key IS NOT NULL AND category_key != '' AND (button_id IS NULL OR button_id = 0)"
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return
 
-        ins("مگنتار و چراغ لاینی", 0, "magnetar_line", 0)
-        switches = ins("کلید ، پریز هوشمند و مکانیکی", 0, None, 1)
-        ins("صنعتی ساختمانی", 0, "industrial", 2)
-        facade = ins("نمای ساختمان - محوطه - استخری", 0, None, 3)
-        ins("سیم و کابل", 0, "wire_cable", 4)
-        ins("آیفون", 0, "intercom", 5)
-        ins("اعلان حریق", 0, "fire_alarm", 6)
-        ins("پریز کابینتی میلو", 0, "milo_socket", 7)
-        ins("پریز کابینتی ملونی", 0, "meloni_socket", 8)
+        cur.execute("SELECT id, legacy_key FROM menu_buttons WHERE legacy_key IS NOT NULL")
+        key_map = {legacy_key: bid for bid, legacy_key in cur.fetchall()}
 
-        ins("پریز و کلید هوشمند", switches, "smart_switches", 0)
-        ins("کلید مکانیکی", switches, "mechanical_switches", 1)
+        for cat_id, category_key in rows:
+            bid = key_map.get(category_key)
+            if bid:
+                cur.execute("UPDATE catalogs SET button_id = ? WHERE id = ?", (bid, cat_id))
 
-        ins("مد نور", facade, "mod_noor", 0)
-        ins("شعاع", facade, "shaa", 1)
-        ins("انوار", facade, "anvar", 2)
+        conn.commit()
 
-        c.commit()
-
+    # ---------- scoped reset ----------
     def reset_menu(self):
-        """بازنشانی فقط منو و فایل‌ها (تنظیمات/کاربران دست‌نخورده باقی می‌مانند)"""
-        c = self.conn()
-        try:
-            c.execute("DELETE FROM catalogs;")
-            c.execute("DELETE FROM menu_buttons;")
-            c.commit()
-            self._seed_defaults(c)
-            c.commit()
-            return True
-        except Exception as e:
-            c.rollback()
-            logger.error(f"Menu reset error: {e}")
-            return False
-        finally:
-            c.close()
-
-    # ── USERS ──
-    def add_user(self, uid, uname, fname, lname):
         conn = self.conn()
-        now = datetime.now().isoformat()
-        conn.execute(
-            "INSERT INTO users (user_id,username,first_name,last_name,join_date,last_activity) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET "
-            "username=excluded.username, first_name=excluded.first_name, "
-            "last_name=excluded.last_name, last_activity=excluded.last_activity",
-            (uid, uname, fname, lname, now, now))
-        conn.commit(); conn.close()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM catalogs")
+        cur.execute("DELETE FROM menu_buttons")
+        conn.commit()
+        conn.close()
+        # re-init fresh
+        self.init_db()
+
+    # ---------- users ----------
+    def add_user(self, user_id, username, first_name):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, username, first_name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name
+        """, (user_id, username, first_name))
+        conn.commit()
+        conn.close()
 
     def get_all_users(self):
-        c = self.conn()
-        rows = [dict(r) for r in c.execute("SELECT * FROM users").fetchall()]
-        c.close(); return rows
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        rows = [r[0] for r in cur.fetchall()]
+        conn.close()
+        return rows
 
-    # ── MENU BUTTONS (ویرایشگر منو) ──
+    # ---------- menu tree ----------
     def get_buttons(self, parent_id=0):
-        c = self.conn()
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM menu_buttons WHERE parent_id=? ORDER BY order_index, id", (parent_id,)
-        ).fetchall()]
-        c.close(); return rows
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, title, parent_id, legacy_key, order_index FROM menu_buttons "
+            "WHERE parent_id = ? ORDER BY order_index ASC, id ASC",
+            (parent_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {"id": r[0], "title": r[1], "parent_id": r[2], "legacy_key": r[3], "order_index": r[4]}
+            for r in rows
+        ]
 
     def get_button(self, button_id):
-        c = self.conn()
-        r = c.execute("SELECT * FROM menu_buttons WHERE id=?", (button_id,)).fetchone()
-        c.close(); return dict(r) if r else None
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, title, parent_id, legacy_key, order_index FROM menu_buttons WHERE id = ?",
+            (button_id,),
+        )
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        return {"id": r[0], "title": r[1], "parent_id": r[2], "legacy_key": r[3], "order_index": r[4]}
 
     def get_button_by_title_parent(self, title, parent_id):
-        c = self.conn()
-        r = c.execute(
-            "SELECT * FROM menu_buttons WHERE title=? AND parent_id=?", (title, parent_id)
-        ).fetchone()
-        c.close(); return dict(r) if r else None
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, title, parent_id, legacy_key, order_index FROM menu_buttons "
+            "WHERE title = ? AND parent_id = ?",
+            (title, parent_id),
+        )
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        return {"id": r[0], "title": r[1], "parent_id": r[2], "legacy_key": r[3], "order_index": r[4]}
 
-    def add_button(self, title, parent_id=0):
-        c = self.conn()
-        max_idx = c.execute(
-            "SELECT COALESCE(MAX(order_index),-1) FROM menu_buttons WHERE parent_id=?", (parent_id,)
-        ).fetchone()[0]
-        c.execute(
-            "INSERT INTO menu_buttons (parent_id, title, order_index) VALUES (?,?,?)",
-            (parent_id, title, max_idx + 1))
-        c.commit(); bid = c.lastrowid; c.close()
-        return bid
+    def add_button(self, title, parent_id):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(order_index), -1) + 1 FROM menu_buttons WHERE parent_id = ?", (parent_id,))
+        next_idx = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO menu_buttons (title, parent_id, legacy_key, order_index) VALUES (?, ?, NULL, ?)",
+            (title, parent_id, next_idx),
+        )
+        new_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return new_id
 
     def rename_button(self, button_id, new_title):
-        c = self.conn()
-        c.execute("UPDATE menu_buttons SET title=? WHERE id=?", (new_title, button_id))
-        c.commit(); c.close()
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("UPDATE menu_buttons SET title = ? WHERE id = ?", (new_title, button_id))
+        conn.commit()
+        conn.close()
 
     def delete_button(self, button_id):
-        c = self.conn()
+        conn = self.conn()
+        cur = conn.cursor()
 
-        def collect(bid):
-            ids = [bid]
-            for ch in c.execute("SELECT id FROM menu_buttons WHERE parent_id=?", (bid,)).fetchall():
-                ids.extend(collect(ch["id"]))
-            return ids
+        def recurse(bid):
+            cur.execute("SELECT id FROM menu_buttons WHERE parent_id = ?", (bid,))
+            for (child_id,) in cur.fetchall():
+                recurse(child_id)
+            cur.execute("DELETE FROM catalogs WHERE button_id = ?", (bid,))
+            cur.execute("DELETE FROM menu_buttons WHERE id = ?", (bid,))
 
-        ids = collect(button_id)
-        qs = ",".join("?" * len(ids))
-        c.execute(f"DELETE FROM catalogs WHERE button_id IN ({qs})", ids)
-        c.execute(f"DELETE FROM menu_buttons WHERE id IN ({qs})", ids)
-        c.commit(); c.close()
+        recurse(button_id)
+        conn.commit()
+        conn.close()
 
     def move_button(self, button_id, direction):
-        """direction: 'up' یا 'down' — جابجایی با دکمه هم‌سطح مجاور"""
-        c = self.conn()
-        btn = c.execute("SELECT * FROM menu_buttons WHERE id=?", (button_id,)).fetchone()
-        if not btn:
-            c.close(); return False
-        siblings = c.execute(
-            "SELECT * FROM menu_buttons WHERE parent_id=? ORDER BY order_index, id",
-            (btn["parent_id"],)
-        ).fetchall()
-        idx = next((i for i, s in enumerate(siblings) if s["id"] == button_id), None)
-        if idx is None:
-            c.close(); return False
-        swap_idx = idx - 1 if direction == "up" else idx + 1
-        if swap_idx < 0 or swap_idx >= len(siblings):
-            c.close(); return False
-        a, b = siblings[idx], siblings[swap_idx]
-        c.execute("UPDATE menu_buttons SET order_index=? WHERE id=?", (b["order_index"], a["id"]))
-        c.execute("UPDATE menu_buttons SET order_index=? WHERE id=?", (a["order_index"], b["id"]))
-        c.commit(); c.close()
-        return True
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("SELECT parent_id, order_index FROM menu_buttons WHERE id = ?", (button_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return
+        parent_id, order_index = row
 
-    # ── CATALOGS / FILES ──
-    def add_catalog_file(self, button_id, file_id, file_name="", note="", file_type="document"):
-        c = self.conn()
-        c.execute(
-            "INSERT INTO catalogs (button_id, file_id, file_name, file_type, note, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (button_id, file_id, file_name, file_type, note, datetime.now().isoformat()))
-        c.commit(); c.close()
+        if direction == "up":
+            cur.execute(
+                "SELECT id, order_index FROM menu_buttons WHERE parent_id = ? AND order_index < ? "
+                "ORDER BY order_index DESC LIMIT 1",
+                (parent_id, order_index),
+            )
+        else:
+            cur.execute(
+                "SELECT id, order_index FROM menu_buttons WHERE parent_id = ? AND order_index > ? "
+                "ORDER BY order_index ASC LIMIT 1",
+                (parent_id, order_index),
+            )
+        neighbor = cur.fetchone()
+        if neighbor:
+            neighbor_id, neighbor_idx = neighbor
+            cur.execute("UPDATE menu_buttons SET order_index = ? WHERE id = ?", (neighbor_idx, button_id))
+            cur.execute("UPDATE menu_buttons SET order_index = ? WHERE id = ?", (order_index, neighbor_id))
+            conn.commit()
+        conn.close()
+
+    # ---------- catalogs / files ----------
+    def add_catalog_file(self, button_id, file_id, file_name, note, file_type):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO catalogs (button_id, file_id, file_name, note, file_type) VALUES (?, ?, ?, ?, ?)",
+            (button_id, file_id, file_name, note, file_type),
+        )
+        new_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return new_id
 
     def get_catalogs(self, button_id):
-        c = self.conn()
-        rows = [dict(r) for r in c.execute(
-            "SELECT * FROM catalogs WHERE button_id=? ORDER BY id ASC", (button_id,)
-        ).fetchall()]
-        c.close(); return rows
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, button_id, file_id, file_name, note, file_type FROM catalogs "
+            "WHERE button_id = ? ORDER BY id ASC",
+            (button_id,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {"id": r[0], "button_id": r[1], "file_id": r[2], "file_name": r[3], "note": r[4], "file_type": r[5]}
+            for r in rows
+        ]
 
-    def get_catalog_by_id(self, cat_id):
-        c = self.conn()
-        r = c.execute("SELECT * FROM catalogs WHERE id=?", (cat_id,)).fetchone()
-        c.close(); return dict(r) if r else None
+    def get_catalog_by_id(self, catalog_id):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, button_id, file_id, file_name, note, file_type FROM catalogs WHERE id = ?",
+            (catalog_id,),
+        )
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        return {"id": r[0], "button_id": r[1], "file_id": r[2], "file_name": r[3], "note": r[4], "file_type": r[5]}
 
-    def delete_catalog(self, cat_id):
-        c = self.conn()
-        c.execute("DELETE FROM catalogs WHERE id=?", (cat_id,))
-        c.commit(); c.close()
+    def delete_catalog(self, catalog_id):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM catalogs WHERE id = ?", (catalog_id,))
+        conn.commit()
+        conn.close()
 
     def get_section_breakdown(self):
-        """تعداد فایل در هر بخش که حداقل یک فایل دارد"""
-        c = self.conn()
-        rows = c.execute("""
-            SELECT m.title as title, COUNT(c.id) as cnt
-            FROM catalogs c JOIN menu_buttons m ON m.id = c.button_id
-            GROUP BY c.button_id ORDER BY cnt DESC
-        """).fetchall()
-        c.close()
-        return [(r["title"], r["cnt"]) for r in rows]
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COALESCE(mb.title, 'عمومی (ریشه)') AS title, COUNT(c.id) AS cnt
+            FROM catalogs c
+            LEFT JOIN menu_buttons mb ON mb.id = c.button_id
+            GROUP BY c.button_id
+            ORDER BY cnt DESC
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        return [{"title": r[0], "count": r[1]} for r in rows]
 
-    # ── SETTINGS ──
-    def set_setting(self, key, val):
-        c = self.conn()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, val))
-        c.commit(); c.close()
+    # ---------- settings ----------
+    def set_setting(self, key, value):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+        conn.commit()
+        conn.close()
 
-    def get_setting(self, key, default=""):
-        c = self.conn()
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        c.close(); return r["value"] if r and r["value"] else default
+    def get_setting(self, key, default=None):
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        r = cur.fetchone()
+        conn.close()
+        return r[0] if r else default
 
-    # ── STATS ──
+    # ---------- stats ----------
     def get_stats(self):
-        c = self.conn()
-        u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        f = c.execute("SELECT COUNT(*) FROM catalogs").fetchone()[0]
-        b = c.execute("SELECT COUNT(*) FROM menu_buttons").fetchone()[0]
-        c.close()
-        return {"total_users": u, "total_files": f, "total_buttons": b}
+        conn = self.conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM catalogs")
+        files = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM menu_buttons")
+        buttons = cur.fetchone()[0]
+        conn.close()
+        return {"users": users, "files": files, "buttons": buttons}
 
-    # ── BACKUP / RESTORE ──
+    # ---------- backup / restore ----------
     def backup_to_file(self, target_path):
-        """Safe backup using SQLite's online backup API."""
-        src = sqlite3.connect(self.db_name)
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        src = self.conn()
         dst = sqlite3.connect(target_path)
         with dst:
             src.backup(dst)
-        dst.close(); src.close()
+        dst.close()
+        src.close()
         return target_path
 
     def restore_from_file(self, source_path):
-        """Validate and restore from a .db file. Returns True on success."""
-        try:
-            test = sqlite3.connect(source_path)
-            test.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            test.close()
+        # validate it's a real sqlite db
+        with open(source_path, "rb") as f:
+            header = f.read(16)
+        if not header.startswith(b"SQLite format 3"):
+            raise ValueError("فایل آپلودشده یک دیتابیس SQLite معتبر نیست.")
 
-            if os.path.exists(self.db_name):
-                self.backup_to_file(self.db_name + ".pre_restore_backup")
+        if os.path.exists(DB_PATH):
+            backup_path = DB_PATH + ".pre_restore_backup"
+            shutil.copy2(DB_PATH, backup_path)
 
-            shutil.copy2(source_path, self.db_name)
+        shutil.copy2(source_path, DB_PATH)
 
-            # نکته‌ی مهم: اگر بکاپ مربوط به نسخه‌ی قدیمی ربات باشد (بدون جدول
-            # منوی پویا)، باید migration دوباره اجرا شود تا ربات کرش نکند.
-            self.init_db()
-            return True
-        except Exception as e:
-            logging.error(f"Restore failed: {e}")
-            return False
+        # re-run migrations in case the restored backup is from an older schema
+        self.init_db()
+        return True
