@@ -4,7 +4,6 @@ import os
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 def get_db_connection():
-    # فعال‌سازی WAL Mode برای جلوگیری از قفل شدن دیتابیس (database is locked)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -69,7 +68,7 @@ def _seed_defaults(cursor):
         cursor.execute("INSERT INTO menu_buttons (title, parent_id) VALUES ('محصولات و قیمت‌ها', 0)")
 
 def reset_bot_config():
-    """بازنشانی کامل دکمه‌ها، کاتالوگ‌ها و تنظیمات به حالت اولیه"""
+    """بازنشانی کامل دکمه‌ها، کاتالوگ‌ها و تنظیمات متنی"""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -112,12 +111,6 @@ def get_user_count():
     conn.close()
     return count
 
-def toggle_block_user(user_id):
-    conn = get_db_connection()
-    conn.execute("UPDATE users SET is_blocked = CASE WHEN is_blocked=1 THEN 0 ELSE 1 END WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
 # --- دکمه‌ها و کاتالوگ‌ها ---
 def get_buttons(parent_id=0, admin_mode=False):
     conn = get_db_connection()
@@ -148,12 +141,6 @@ def delete_button(button_id):
     conn.commit()
     conn.close()
 
-def toggle_button_hide(button_id):
-    conn = get_db_connection()
-    conn.execute("UPDATE menu_buttons SET is_hidden = CASE WHEN is_hidden=1 THEN 0 ELSE 1 END WHERE id=?", (button_id,))
-    conn.commit()
-    conn.close()
-
 def add_catalog(button_id, file_id, file_type, caption):
     conn = get_db_connection()
     conn.execute("INSERT INTO catalogs (button_id, file_id, file_type, caption) VALUES (?, ?, ?, ?)", 
@@ -166,12 +153,6 @@ def get_catalogs(button_id):
     catalogs = conn.execute("SELECT * FROM catalogs WHERE button_id=?", (button_id,)).fetchall()
     conn.close()
     return [dict(c) for c in catalogs]
-
-def delete_catalog(catalog_id):
-    conn = get_db_connection()
-    conn.execute("DELETE FROM catalogs WHERE id=?", (catalog_id,))
-    conn.commit()
-    conn.close()
 
 # --- تنظیمات ---
 def get_setting(key, default=""):
