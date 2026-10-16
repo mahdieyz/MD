@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 
 db = Database()
 
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip()]
+def get_admin_ids():
+    raw = os.environ.get('ADMIN_IDS', '')
+    return [int(x.strip()) for x in raw.split(',') if x.strip().isdigit()]
 
-# ─── Structure ───
+# Menu Structure
 MAIN_MENU = [
     ["مگنتار و چراغ لاینی"],
     ["کلید ، پریز هوشمند و مکانیکی"],
@@ -48,7 +50,7 @@ for sub in SUB_MENUS.values():
 
 BUTTON_REGEX = re.compile('^(' + '|'.join(re.escape(b) for b in ALL_BUTTONS) + ')$')
 
-# Admin conversation states
+# Conversation States
 (ADMIN_MENU, UPLOAD_CATEGORY, UPLOAD_FILE, UPLOAD_NOTE,
  DELETE_SELECT_CAT, DELETE_SELECT_ITEM,
  EDIT_CONTACT, BROADCAST_MSG, RESTORE_DB) = range(9)
@@ -64,10 +66,8 @@ ADMIN_KEYBOARD = [
     ["❌ خروج از پنل"]
 ]
 
-
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
-
+    return user_id in get_admin_ids()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -77,7 +77,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     keyboard = ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True)
     await update.message.reply_text(welcome_text, reply_markup=keyboard)
-
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -123,10 +122,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error sending catalog {cat['id']}: {e}")
                 await update.message.reply_text(f"⚠️ خطا در ارسال فایل #{cat['id']}")
     else:
-        await update.message.reply_text(f"📂 {text}\n\nفایلی در این دسته‌بندی ثبت نشده است.")
+        await update.message.reply_text(f"📂 {text}\n\nفایلی در این دسته‌بندی موجود نیست.")
 
-
-# ─── Admin Handlers ───
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ شما دسترسی ادمین ندارید.")
@@ -134,7 +131,6 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text("🔧 پنل مدیریت تلگرام:", reply_markup=keyboard)
     return ADMIN_MENU
-
 
 async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -158,7 +154,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if text == "🗑️ مدیریت / حذف کاتالوگ":
         cats = db.get_all_categories()
         if not cats:
-            await update.message.reply_text("هیچ فایلی در دیتابیس موجود نیست.")
+            await update.message.reply_text("هیچ فایلی موجود نیست.")
             return ADMIN_MENU
         kb = [[c] for c in cats] + [["❌ انصراف"]]
         keyboard = ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -179,24 +175,10 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         active_users = db.get_active_user_count()
         total_files = db.get_catalog_count()
         cat_stats = db.get_category_stats()
-        broadcasts = db.get_broadcast_logs(5)
 
-        stats = f"""📊 آمار ربات:
-
-👥 کل کاربران: {total_users}
-✅ کاربران فعال: {active_users}
-🚫 کاربران بلاک‌شده: {total_users - active_users}
-📁 کل فایل‌ها: {total_files}
-
-📂 فایل‌ها به تفکیک:
-"""
+        stats = f"📊 آمار ربات:\n\n👥 کل کاربران: {total_users}\n✅ کاربران فعال: {active_users}\n📁 کل فایل‌ها: {total_files}\n\n📂 تفکیک دسته‌ها:\n"
         for cs in cat_stats:
             stats += f"  • {cs['category']}: {cs['cnt']}\n"
-
-        if broadcasts:
-            stats += "\n📢 آخرین پیام‌های همگانی:\n"
-            for b in broadcasts:
-                stats += f"  • {b['sent_at'][:16]} — ✅{b['sent_count']} ❌{b['fail_count']}\n"
 
         await update.message.reply_text(stats)
         return ADMIN_MENU
@@ -220,7 +202,6 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("گزینه نامعتبر است.")
     return ADMIN_MENU
 
-
 async def upload_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "❌ انصراف":
@@ -233,7 +214,6 @@ async def upload_category_handler(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=ReplyKeyboardMarkup([["❌ انصراف"]], resize_keyboard=True)
     )
     return UPLOAD_FILE
-
 
 async def upload_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -259,7 +239,6 @@ async def upload_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text("یادداشت قیمت (مثلاً 'لیست بعلاوه ۲۰ درصد میباشد') را بنویسید.\nجهت رد کردن /skip ارسال کنید:")
     return UPLOAD_NOTE
 
-
 async def upload_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     note = None if text == '/skip' else text
@@ -278,7 +257,6 @@ async def upload_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ فایل #{catalog_id} در «{context.user_data['upload_category']}» ذخیره شد.", reply_markup=keyboard)
     context.user_data.clear()
     return ADMIN_MENU
-
 
 async def delete_cat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -304,7 +282,6 @@ async def delete_cat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg)
     return DELETE_SELECT_ITEM
 
-
 async def delete_item_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == '/cancel':
@@ -319,15 +296,14 @@ async def delete_item_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             db.delete_catalog(catalog_id)
             await update.message.reply_text(f"✅ فایل #{catalog_id} با موفقیت حذف شد.")
         else:
-            await update.message.reply_text("فایل با این آیدی یافت نشد.")
+            await update.message.reply_text("فایل یافت نشد.")
     except ValueError:
-        await update.message.reply_text("لطفاً یک عدد صحیح وارد کنید.")
+        await update.message.reply_text("لطفاً یک عدد وارد کنید.")
         return DELETE_SELECT_ITEM
 
     keyboard = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text("پنل مدیریت:", reply_markup=keyboard)
     return ADMIN_MENU
-
 
 async def edit_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -339,7 +315,6 @@ async def edit_contact_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
     await update.message.reply_text("✅ اطلاعات تماس بروزرسانی شد.", reply_markup=keyboard)
     return ADMIN_MENU
-
 
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -359,19 +334,13 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent += 1
         except Exception:
             failed += 1
-        if (sent + failed) % 25 == 0:
-            try:
-                await status_msg.edit_text(f"📢 ارسال... {sent + failed}/{len(user_ids)}")
-            except Exception:
-                pass
         await asyncio.sleep(0.04)
 
     db.log_broadcast(text, sent, failed, update.effective_user.id)
     keyboard = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
-    await status_msg.edit_text(f"✅ ارسال تکمیل شد.\n✅ موفق: {sent}\n❌ ناموفق: {failed}")
+    await status_msg.edit_text(f"✅ ارسال تمام شد.\n✅ موفق: {sent}\n❌ ناموفق: {failed}")
     await update.message.reply_text("پنل مدیریت:", reply_markup=keyboard)
     return ADMIN_MENU
-
 
 async def restore_db_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -394,18 +363,19 @@ async def restore_db_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard = ReplyKeyboardMarkup(ADMIN_KEYBOARD, resize_keyboard=True)
         await msg.reply_text("✅ دیتابیس با موفقیت بازگردانی شد.", reply_markup=keyboard)
     except Exception as e:
-        await msg.reply_text(f"⚠️ خطا در بازگردانی: {e}")
+        await msg.reply_text(f"⚠️ خطا: {e}")
     return ADMIN_MENU
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(MAIN_MENU, resize_keyboard=True)
     await update.message.reply_text("لغو شد.", reply_markup=keyboard)
     return ConversationHandler.END
 
-
 def create_bot_app():
-    token = os.environ['BOT_TOKEN']
+    token = os.environ.get('BOT_TOKEN', '').strip()
+    if not token:
+        raise ValueError("BOT_TOKEN is not set in environment variables!")
+
     app = Application.builder().token(token).build()
 
     admin_conv = ConversationHandler(
