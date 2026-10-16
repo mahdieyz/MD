@@ -14,8 +14,21 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
 
 # States for conversation
-(UPLOAD_CAT, UPLOAD_FILE, UPLOAD_NOTE, SET_CONTACT, SET_WELCOME, BROADCAST,
- RESTORE_DB, MANAGE_CAT, EDIT_BTN, SUB_PARENT, SUB_LIST, SUB_EDIT, SUB_ADD) = range(14)
+(
+    UPLOAD_CAT,
+    UPLOAD_FILE,
+    UPLOAD_NOTE,
+    SET_CONTACT,
+    SET_WELCOME,
+    BROADCAST,
+    RESTORE_DB,
+    MANAGE_CAT,
+    EDIT_BTN,
+    SUB_PARENT,
+    SUB_LIST,
+    SUB_EDIT,
+    SUB_ADD,
+) = range(13)
 
 def is_admin(uid):
     return uid in ADMIN_IDS
