@@ -21,7 +21,7 @@ def is_admin(uid):
 # ── KEYBOARDS ──
 
 CATEGORY_MAP = {
-    "مد نور": "mod_noor",
+    "test": "mod_noor",
     "مگنتار و چراغ لاینی": "magnetar_line",
     "صنعتی ساختمانی": "industrial",
     "سیم و کابل": "wire_cable",
