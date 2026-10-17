@@ -496,12 +496,14 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
     for b in buttons:
         rows.append([InlineKeyboardButton(_tree_row_label(b["title"]), callback_data=f"admtree_{b['id']}")])
         rows.append([
-            InlineKeyboardButton("✏️", callback_data=f"admrenamebtn_{b['id']}"),
-            InlineKeyboardButton("🎨", callback_data=f"admcolor_{b['id']}"),
-            InlineKeyboardButton("🗑️", callback_data=f"admdelbtn_{b['id']}"),
-            InlineKeyboardButton("⬆️", callback_data=f"admmoveup_{b['id']}"),
-            InlineKeyboardButton("⬇️", callback_data=f"admmovedown_{b['id']}"),
-            InlineKeyboardButton("📄", callback_data=f"admfiles_{b['id']}"),
+            InlineKeyboardButton("✏️ ویرایش", callback_data=f"admrenamebtn_{b['id']}"),
+            InlineKeyboardButton("🎨 رنگ", callback_data=f"admcolor_{b['id']}"),
+            InlineKeyboardButton("🗑️ حذف", callback_data=f"admdelbtn_{b['id']}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("⬆️ بالا", callback_data=f"admmoveup_{b['id']}"),
+            InlineKeyboardButton("⬇️ پایین", callback_data=f"admmovedown_{b['id']}"),
+            InlineKeyboardButton("📄 محتوا", callback_data=f"admfiles_{b['id']}"),
         ])
 
     rows.append([InlineKeyboardButton("➕ افزودن دکمه/گروه", callback_data=f"admaddbtn_{parent_id}")])
