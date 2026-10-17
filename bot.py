@@ -1,4 +1,5 @@
 import os
+import html
 import logging
 import tempfile
 from datetime import datetime
@@ -64,18 +65,23 @@ db = Database()
     SET_WELCOME,
     SET_MENU_TEXT,
     SET_SUBMENU_TEXT,
+    SET_PHONE,
     BROADCAST,
     RESTORE_DB,
-) = range(11)
+) = range(12)
 
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
 ADMIN_BTN = "🔧 پنل مدیریت"
 BACK_HOME_BTN = "🔙 بازگشت به منوی اصلی"
+SEARCH_BTN = "🔍 جستجو"
+PREV_PAGE_BTN = "⬅️ صفحه قبل"
+NEXT_PAGE_BTN = "➡️ صفحه بعد"
 DIVIDER = "➖➖➖➖➖➖➖➖➖➖"
 
 GLASS_MODE_KEY = "glass_mode"
 WELCOME_TEXT_KEY = "welcome_text"
 CONTACT_TEXT_KEY = "contact_text"
+CONTACT_PHONE_KEY = "contact_phone"
 MAIN_MENU_TEXT_KEY = "main_menu_text"
 SUBMENU_TEXT_KEY = "submenu_text"
 
@@ -86,9 +92,11 @@ WELCOME_TEXT_DEFAULT = (
 )
 MAIN_MENU_TEXT_DEFAULT = "لطفاً یک گزینه را انتخاب کنید:"
 CONTACT_TEXT_DEFAULT = "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000"
+CONTACT_PHONE_DEFAULT = "09120000000"
 
 SUBMENU_PLACEHOLDER = "\u2063"
 CLEAR_SENTINEL = "-"
+PAGE_SIZE = 8
 
 # Color tagging for buttons (Telegram has no real button-color API, so we
 # fake it with a leading colored-circle emoji in the button title).
@@ -129,11 +137,19 @@ def get_contact_text() -> str:
     return db.get_setting(CONTACT_TEXT_KEY, CONTACT_TEXT_DEFAULT)
 
 
+def get_contact_phone() -> str:
+    return db.get_setting(CONTACT_PHONE_KEY, CONTACT_PHONE_DEFAULT)
+
+
 def get_submenu_text() -> str:
     val = db.get_setting(SUBMENU_TEXT_KEY, "")
     if not val or not val.strip():
         return SUBMENU_PLACEHOLDER
     return val
+
+
+def sanitize_phone(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit() or ch == "+")
 
 
 def strip_color(title: str) -> str:
@@ -167,12 +183,41 @@ def color_picker_kb(callback_prefix: str, cancel_callback: str) -> InlineKeyboar
     return InlineKeyboardMarkup(rows)
 
 
+def paginate(items, page, page_size=PAGE_SIZE):
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    return items[start:start + page_size], page, total_pages
+
+
+def contact_inline_kb(back=False):
+    phone = get_contact_phone()
+    rows = []
+    if phone:
+        rows.append([InlineKeyboardButton("☎️ تماس مستقیم", url=f"tel:{phone}")])
+    if back:
+        rows.append([InlineKeyboardButton(BACK_HOME_BTN, callback_data="uhome")])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
         if "message is not modified" not in str(e).lower():
             raise
+
+
+def log_admin_activity(update, action, details=""):
+    user = update.effective_user
+    if user.username:
+        admin_name = f"@{user.username}"
+    else:
+        admin_name = user.full_name or str(user.id)
+    db.log_activity(user.id, admin_name, action, details)
 
 
 # ============================================================
@@ -221,11 +266,10 @@ async def track_incoming(update, context):
 # Reply-keyboard (classic) mode
 # ============================================================
 
-def build_menu_kb(parent_id: int, user_id: int) -> ReplyKeyboardMarkup:
-    buttons = db.get_buttons(parent_id)
+def build_menu_kb_from_items(page_items, parent_id, user_id, page, total_pages):
     rows = []
     row = []
-    for b in buttons:
+    for b in page_items:
         row.append(KeyboardButton(b["title"]))
         if len(row) == 2:
             rows.append(row)
@@ -233,15 +277,29 @@ def build_menu_kb(parent_id: int, user_id: int) -> ReplyKeyboardMarkup:
     if row:
         rows.append(row)
 
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(KeyboardButton(PREV_PAGE_BTN))
+        if page < total_pages - 1:
+            nav.append(KeyboardButton(NEXT_PAGE_BTN))
+        if nav:
+            rows.append(nav)
+
     if parent_id == 0:
-        bottom = [KeyboardButton(CONTACT_BTN)]
+        rows.append([KeyboardButton(CONTACT_BTN), KeyboardButton(SEARCH_BTN)])
         if is_admin(user_id):
-            bottom.append(KeyboardButton(ADMIN_BTN))
-        rows.append(bottom)
+            rows.append([KeyboardButton(ADMIN_BTN)])
     else:
         rows.append([KeyboardButton(BACK_HOME_BTN)])
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def build_menu_kb(parent_id: int, user_id: int, page: int = 0) -> ReplyKeyboardMarkup:
+    all_buttons = db.get_buttons(parent_id)
+    page_items, page, total_pages = paginate(all_buttons, page)
+    return build_menu_kb_from_items(page_items, parent_id, user_id, page, total_pages)
 
 
 async def _send_section_items(context, chat_id, items):
@@ -255,9 +313,20 @@ async def _send_section_items(context, chat_id, items):
             await send_document(context, chat_id, item["file_id"], caption=item["note"] or None)
 
 
-async def show_menu(context, chat_id, parent_id, user_id):
-    kb = build_menu_kb(parent_id, user_id)
-    text = get_main_menu_text() if parent_id == 0 else get_submenu_text()
+async def show_menu(context, chat_id, parent_id, user_id, page=0):
+    all_buttons = db.get_buttons(parent_id)
+    page_items, page, total_pages = paginate(all_buttons, page)
+    context.user_data["menu_page"] = page
+
+    kb = build_menu_kb_from_items(page_items, parent_id, user_id, page, total_pages)
+    base_text = get_main_menu_text() if parent_id == 0 else get_submenu_text()
+
+    if total_pages > 1:
+        page_info = f"📄 صفحه {page + 1} از {total_pages}"
+        text = page_info if base_text == SUBMENU_PLACEHOLDER else f"{base_text}\n\n{page_info}"
+    else:
+        text = base_text
+
     await send_text(context, chat_id, text, reply_markup=kb)
 
 
@@ -270,13 +339,59 @@ async def enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE, butto
     if items:
         await _send_section_items(context, chat_id, items)
 
-    await show_menu(context, chat_id, button["id"], user_id)
+    await show_menu(context, chat_id, button["id"], user_id, 0)
+
+
+async def do_search(update, context, query_text):
+    chat_id = update.effective_chat.id
+    if not query_text:
+        await reply_text(update, context, "⚠️ عبارت جستجو نباید خالی باشد.")
+        return
+
+    buttons, contents = db.search(query_text)
+    seen_ids = set()
+    rows = []
+
+    for b in buttons[:15]:
+        if b["id"] in seen_ids:
+            continue
+        seen_ids.add(b["id"])
+        rows.append([InlineKeyboardButton(f"📂 {b['title']}", callback_data=f"ucat_{b['id']}")])
+
+    for c in contents[:15]:
+        bid = c["button_id"]
+        if bid == 0 or bid in seen_ids:
+            continue
+        seen_ids.add(bid)
+        parent = db.get_button(bid)
+        parent_title = parent["title"] if parent else "بخش"
+        preview = (c["note"] or c["file_name"] or "").strip().replace("\n", " ")
+        if len(preview) > 30:
+            preview = preview[:30] + "…"
+        rows.append([InlineKeyboardButton(f"📄 {parent_title} › {preview}", callback_data=f"ucat_{bid}")])
+
+    if not rows:
+        await reply_text(update, context, f"🔍 برای «{query_text}» نتیجه‌ای یافت نشد.")
+        return
+
+    kb = InlineKeyboardMarkup(rows)
+    await reply_text(update, context, f"🔍 نتایج جستجو برای «{query_text}»:", reply_markup=kb)
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting_search"] = True
+    await reply_text(update, context, "🔍 کلمه موردنظر برای جستجو را ارسال کنید:")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+
+    if context.user_data.get("awaiting_search"):
+        context.user_data["awaiting_search"] = False
+        await do_search(update, context, text.strip())
+        return
 
     if is_glass_mode():
         if text == ADMIN_BTN and is_admin(user_id):
@@ -288,13 +403,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if text == SEARCH_BTN:
+        context.user_data["awaiting_search"] = True
+        await reply_text(update, context, "🔍 کلمه موردنظر برای جستجو را ارسال کنید:")
+        return
+
+    if text == PREV_PAGE_BTN:
+        parent_id = context.user_data.get("parent_id", 0)
+        page = max(0, context.user_data.get("menu_page", 0) - 1)
+        await show_menu(context, chat_id, parent_id, user_id, page)
+        return
+
+    if text == NEXT_PAGE_BTN:
+        parent_id = context.user_data.get("parent_id", 0)
+        page = context.user_data.get("menu_page", 0) + 1
+        await show_menu(context, chat_id, parent_id, user_id, page)
+        return
+
     if text == BACK_HOME_BTN:
         context.user_data["parent_id"] = 0
-        await show_menu(context, chat_id, 0, user_id)
+        await show_menu(context, chat_id, 0, user_id, 0)
         return
 
     if text == CONTACT_BTN:
-        await reply_text(update, context, get_contact_text())
+        await reply_text(update, context, get_contact_text(), reply_markup=contact_inline_kb())
         return
 
     if text == ADMIN_BTN:
@@ -312,7 +444,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not button:
         context.user_data["parent_id"] = 0
-        await show_menu(context, chat_id, 0, user_id)
+        await show_menu(context, chat_id, 0, user_id, 0)
         return
 
     await enter_button(update, context, button)
@@ -326,12 +458,12 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = build_menu_inline_kb(0, user_id)
         await send_text(context, chat_id, get_main_menu_text(), reply_markup=kb)
     else:
-        await show_menu(context, chat_id, 0, user_id)
+        await show_menu(context, chat_id, 0, user_id, 0)
 
 
 async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await send_text(context, chat_id, get_contact_text())
+    await send_text(context, chat_id, get_contact_text(), reply_markup=contact_inline_kb())
 
 
 async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,11 +491,13 @@ async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Glass / inline mode
 # ============================================================
 
-def build_menu_inline_kb(parent_id: int, user_id: int) -> InlineKeyboardMarkup:
-    buttons = db.get_buttons(parent_id)
+def build_menu_inline_kb(parent_id: int, user_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_buttons = db.get_buttons(parent_id)
+    page_items, page, total_pages = paginate(all_buttons, page)
+
     rows = []
     row = []
-    for b in buttons:
+    for b in page_items:
         row.append(InlineKeyboardButton(b["title"], callback_data=f"ucat_{b['id']}"))
         if len(row) == 2:
             rows.append(row)
@@ -371,14 +505,43 @@ def build_menu_inline_kb(parent_id: int, user_id: int) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
 
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"umenu_{parent_id}_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("➡️ بعدی", callback_data=f"umenu_{parent_id}_{page + 1}"))
+        rows.append(nav)
+
     if parent_id == 0:
         rows.append([InlineKeyboardButton(CONTACT_BTN, callback_data="ucontact")])
+        rows.append([InlineKeyboardButton(SEARCH_BTN, callback_data="usearch")])
         if is_admin(user_id):
             rows.append([InlineKeyboardButton(ADMIN_BTN, callback_data="admhome")])
     else:
         rows.append([InlineKeyboardButton(BACK_HOME_BTN, callback_data="uhome")])
 
     return InlineKeyboardMarkup(rows)
+
+
+async def render_user_menu(query, context, parent_id, page, user_id, chat_id=None):
+    all_buttons = db.get_buttons(parent_id)
+    page_items, clamped_page, total_pages = paginate(all_buttons, page)
+    kb = build_menu_inline_kb(parent_id, user_id, clamped_page)
+    base_text = get_main_menu_text() if parent_id == 0 else get_submenu_text()
+
+    if total_pages > 1:
+        page_info = f"📄 صفحه {clamped_page + 1} از {total_pages}"
+        text = page_info if base_text == SUBMENU_PLACEHOLDER else f"{base_text}\n\n{page_info}"
+    else:
+        text = base_text
+
+    try:
+        await safe_edit(query, text, reply_markup=kb)
+    except BadRequest:
+        if chat_id is not None:
+            await send_text(context, chat_id, text, reply_markup=kb)
 
 
 async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,13 +553,25 @@ async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "uhome":
         context.user_data["parent_id"] = 0
-        kb = build_menu_inline_kb(0, user_id)
-        await safe_edit(query, get_main_menu_text(), reply_markup=kb)
+        await render_user_menu(query, context, 0, 0, user_id, chat_id=chat_id)
         return
 
     if data == "ucontact":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(BACK_HOME_BTN, callback_data="uhome")]])
+        kb = contact_inline_kb(back=True)
         await safe_edit(query, get_contact_text(), reply_markup=kb)
+        return
+
+    if data == "usearch":
+        context.user_data["awaiting_search"] = True
+        await send_text(context, chat_id, "🔍 کلمه موردنظر برای جستجو را ارسال کنید:")
+        return
+
+    if data.startswith("umenu_"):
+        parts = data.split("_")
+        parent_id = int(parts[1])
+        page = int(parts[2])
+        context.user_data["parent_id"] = parent_id
+        await render_user_menu(query, context, parent_id, page, user_id, chat_id=chat_id)
         return
 
     if data.startswith("ucat_"):
@@ -404,7 +579,7 @@ async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         button = db.get_button(button_id)
         if not button:
             context.user_data["parent_id"] = 0
-            await safe_edit(query, get_main_menu_text(), reply_markup=build_menu_inline_kb(0, user_id))
+            await render_user_menu(query, context, 0, 0, user_id, chat_id=chat_id)
             return
 
         context.user_data["parent_id"] = button_id
@@ -413,12 +588,7 @@ async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if items:
             await _send_section_items(context, chat_id, items)
 
-        kb = build_menu_inline_kb(button_id, user_id)
-        text = get_submenu_text()
-        try:
-            await safe_edit(query, text, reply_markup=kb)
-        except BadRequest:
-            await send_text(context, chat_id, text, reply_markup=kb)
+        await render_user_menu(query, context, button_id, 0, user_id, chat_id=chat_id)
         return
 
 
@@ -426,6 +596,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.add_user(user.id, user.username, user.first_name)
     context.user_data["parent_id"] = 0
+    context.user_data["menu_page"] = 0
 
     name = user.first_name or "کاربر"
     welcome = get_welcome_text().format(name=name)
@@ -480,8 +651,10 @@ def admin_home_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👋 پیام خوش‌آمدگویی", callback_data="admwelcome")],
         [InlineKeyboardButton("🏠 متن سربرگ منوی اصلی", callback_data="admmenutext")],
         [InlineKeyboardButton("📂 متن سربرگ زیرمنوها", callback_data="admsubmenutext")],
+        [InlineKeyboardButton("☎️ شماره تماس مستقیم", callback_data="admphone")],
         [InlineKeyboardButton("📞 تنظیم متن تماس", callback_data="admcontact")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="admbroadcast")],
+        [InlineKeyboardButton("📜 گزارش فعالیت‌ها", callback_data="admlog")],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="admbackup")],
         [InlineKeyboardButton("♻️ بازیابی بکاپ", callback_data="admrestore")],
         [InlineKeyboardButton("📊 آمار", callback_data="admstats")],
@@ -547,12 +720,17 @@ async def _show_file_list(query, button_id):
 
 async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
+
+    if data == "noop":
+        await query.answer()
+        return
+
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await query.answer("⛔ دسترسی ندارید", show_alert=True)
         return
     await query.answer()
-    data = query.data
 
     if data == "admhome":
         _clear_conv_keys(context)
@@ -562,24 +740,44 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admtoggleglass":
         new_val = "off" if is_glass_mode() else "on"
         db.set_setting(GLASS_MODE_KEY, new_val)
+        log_admin_activity(update, "تغییر حالت دکمه شیشه‌ای", new_val)
         await safe_edit(query, admin_home_text(), reply_markup=admin_home_kb(), parse_mode=ParseMode.HTML)
         return
 
     if data == "admstats":
         stats = db.get_stats()
+        growth = db.get_user_growth_stats()
         breakdown = db.get_section_breakdown()
         lines = [
             "📊 <b>آمار ربات</b>",
             DIVIDER,
-            f"👤 تعداد کاربران: {stats.get('users', 0)}",
+            f"👤 تعداد کل کاربران: {stats.get('users', 0)}",
+            f"🆕 کاربران جدید امروز: {growth.get('today', 0)}",
+            f"📅 کاربران جدید (۷ روز اخیر): {growth.get('week', 0)}",
+            f"🗓️ کاربران جدید (۳۰ روز اخیر): {growth.get('month', 0)}",
+            DIVIDER,
             f"🗂️ تعداد دکمه‌ها: {stats.get('buttons', 0)}",
             f"📁 تعداد محتوا: {stats.get('catalogs', 0)}",
             DIVIDER,
         ]
         for row in breakdown:
-            lines.append(f"• {row['title']}: {row['count']}")
+            lines.append(f"• {html.escape(str(row['title']))}: {row['count']}")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admhome")]])
         await safe_edit(query, "\n".join(lines), reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    if data == "admlog":
+        entries = db.get_recent_activity(20)
+        if not entries:
+            lines = ["📜 گزارش فعالیت‌ها", DIVIDER, "هنوز فعالیتی ثبت نشده است."]
+        else:
+            lines = ["📜 گزارش فعالیت‌ها (۲۰ مورد اخیر)", DIVIDER]
+            for e in entries:
+                admin_label = e["admin_name"] or str(e["admin_id"])
+                detail = f" - {e['details']}" if e["details"] else ""
+                lines.append(f"🕒 {e['created_at']} | {admin_label}: {e['action']}{detail}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admhome")]])
+        await safe_edit(query, "\n".join(lines), reply_markup=kb)
         return
 
     if data == "admbackup":
@@ -603,6 +801,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admresetmenuyes":
         db.reset_menu()
+        log_admin_activity(update, "ریست منو")
         await safe_edit(query, "✅ منو ریست شد.", reply_markup=admin_home_kb())
         return
 
@@ -634,6 +833,8 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item_id = int(data.split("_", 1)[1])
         item = db.get_catalog_by_id(item_id)
         button_id = item["button_id"] if item else 0
+        if item:
+            log_admin_activity(update, "حذف محتوا", _item_label(item))
         db.delete_catalog(item_id)
         await _show_file_list(query, button_id)
         return
@@ -655,6 +856,8 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         button_id = int(data.split("_", 1)[1])
         button = db.get_button(button_id)
         parent_id = button["parent_id"] if button else 0
+        if button:
+            log_admin_activity(update, "حذف دکمه", strip_color(button["title"]))
         db.delete_button(button_id)
         await safe_edit(query, f"🌳 مدیریت منو\n{DIVIDER}", reply_markup=build_tree_kb(parent_id))
         return
@@ -684,6 +887,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = COLOR_EMOJIS.get(color_key, "")
         new_title = f"{emoji} {base_title}".strip() if emoji else base_title
         db.rename_button(button_id, new_title)
+        log_admin_activity(update, "تغییر رنگ دکمه", new_title)
         await safe_edit(query, f"🌳 مدیریت منو\n{DIVIDER}", reply_markup=build_tree_kb(button["parent_id"]))
         return
 
@@ -695,9 +899,6 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         kb = color_picker_kb(f"admcolorset_{button_id}", f"admtree_{button['parent_id']}")
         await safe_edit(query, f"🎨 انتخاب رنگ برای «{strip_color(button['title'])}»:", reply_markup=kb)
-        return
-
-    if data == "noop":
         return
 
 
@@ -748,6 +949,7 @@ async def save_new_btn_color(update, context):
     parent_id = context.user_data.get("target_parent_id", 0)
     full_title = f"{emoji} {title}".strip() if emoji else title
     db.add_button(full_title, parent_id)
+    log_admin_activity(update, "افزودن دکمه", full_title)
     _clear_conv_keys(context)
     await safe_edit(query, f"✅ «{full_title}» اضافه شد.", reply_markup=build_tree_kb(parent_id))
     return ConversationHandler.END
@@ -786,6 +988,7 @@ async def save_rename_btn_color(update, context):
     button_id = context.user_data.get("rename_button_id")
     full_title = f"{emoji} {title}".strip() if emoji else title
     db.rename_button(button_id, full_title)
+    log_admin_activity(update, "ویرایش دکمه", full_title)
     button = db.get_button(button_id)
     parent_id = button["parent_id"] if button else 0
     _clear_conv_keys(context)
@@ -864,12 +1067,13 @@ async def finish_add_content(update, context):
     await query.answer()
     button_id = context.user_data.get("content_button_id", 0)
     count = context.user_data.get("content_added_count", 0)
+    log_admin_activity(update, "افزودن محتوا", f"{count} مورد")
     _clear_conv_keys(context)
     await safe_edit(query, f"✅ افزودن محتوا پایان یافت. ({count} مورد اضافه شد)", reply_markup=build_tree_kb(button_id))
     return ConversationHandler.END
 
 
-# ---- Simple text settings ----
+# ---- Simple text/phone settings ----
 
 async def prompt_contact(update, context):
     query = update.callback_query
@@ -886,7 +1090,33 @@ async def prompt_contact(update, context):
 async def set_contact_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(CONTACT_TEXT_KEY, text)
+    log_admin_activity(update, "ویرایش متن تماس")
     await reply_text(update, context, "✅ متن تماس بروزرسانی شد.", reply_markup=admin_home_kb())
+    return ConversationHandler.END
+
+
+async def prompt_phone(update, context):
+    query = update.callback_query
+    await query.answer()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="admhome")]])
+    await safe_edit(
+        query,
+        f"☎️ شماره فعلی برای تماس مستقیم:\n\n{get_contact_phone()}\n\n{DIVIDER}\n"
+        "شماره جدید را ارسال کنید (فقط عدد، مثال: 09120000000):",
+        reply_markup=kb,
+    )
+    return SET_PHONE
+
+
+async def set_phone_receive(update, context):
+    raw = update.message.text.strip()
+    phone = sanitize_phone(raw)
+    if not phone:
+        await reply_text(update, context, "⚠️ شماره نامعتبر است. دوباره ارسال کنید:")
+        return SET_PHONE
+    db.set_setting(CONTACT_PHONE_KEY, phone)
+    log_admin_activity(update, "ویرایش شماره تماس مستقیم", phone)
+    await reply_text(update, context, f"✅ شماره تماس به‌روزرسانی شد: {phone}", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
 
@@ -906,6 +1136,7 @@ async def prompt_welcome(update, context):
 async def set_welcome_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(WELCOME_TEXT_KEY, text)
+    log_admin_activity(update, "ویرایش پیام خوش‌آمدگویی")
     preview = text.format(name=update.effective_user.first_name or "کاربر")
     await reply_text(
         update, context,
@@ -930,6 +1161,7 @@ async def prompt_menu_text(update, context):
 async def set_menu_text_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(MAIN_MENU_TEXT_KEY, text)
+    log_admin_activity(update, "ویرایش متن سربرگ منوی اصلی")
     await reply_text(update, context, "✅ متن سربرگ منوی اصلی بروزرسانی شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
@@ -954,6 +1186,7 @@ async def set_submenu_text_receive(update, context):
     text = update.message.text.strip()
     if text == CLEAR_SENTINEL:
         db.set_setting(SUBMENU_TEXT_KEY, "")
+        log_admin_activity(update, "ویرایش متن سربرگ زیرمنوها", "(حذف شد)")
         await reply_text(
             update, context,
             "✅ متن سربرگ زیرمنوها حذف شد. از این پس فقط دکمه‌ها نمایش داده می‌شوند.",
@@ -961,6 +1194,7 @@ async def set_submenu_text_receive(update, context):
         )
     else:
         db.set_setting(SUBMENU_TEXT_KEY, text)
+        log_admin_activity(update, "ویرایش متن سربرگ زیرمنوها")
         await reply_text(update, context, "✅ متن سربرگ زیرمنوها بروزرسانی شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
@@ -983,6 +1217,7 @@ async def broadcast_receive(update, context):
             sent += 1
         except Exception:
             failed += 1
+    log_admin_activity(update, "ارسال پیام همگانی", f"{sent} موفق / {failed} ناموفق")
     await reply_text(update, context, f"✅ ارسال شد به {sent} کاربر.\n❌ ناموفق: {failed}", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
@@ -1014,6 +1249,7 @@ async def restore_db_receive(update, context):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+    log_admin_activity(update, "بازیابی دیتابیس")
     await reply_text(update, context, "✅ بازیابی با موفقیت انجام شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
@@ -1048,6 +1284,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "شروع / بازگشت به منوی اصلی"),
         BotCommand("menu", "نمایش منوی اصلی"),
+        BotCommand("search", "جستجو در منو و محتوا"),
         BotCommand("contact", "تماس با ما"),
         BotCommand("clear", "پاک کردن چت"),
         BotCommand("admin", "پنل مدیریت (ادمین)"),
@@ -1073,6 +1310,7 @@ def main():
             CallbackQueryHandler(prompt_rename_btn, pattern=r"^admrenamebtn_"),
             CallbackQueryHandler(prompt_add_content, pattern=r"^admaddcontent_"),
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
+            CallbackQueryHandler(prompt_phone, pattern=r"^admphone$"),
             CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
             CallbackQueryHandler(prompt_menu_text, pattern=r"^admmenutext$"),
             CallbackQueryHandler(prompt_submenu_text, pattern=r"^admsubmenutext$"),
@@ -1092,6 +1330,7 @@ def main():
                 ),
             ],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
+            SET_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_phone_receive)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             SET_MENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_menu_text_receive)],
             SET_SUBMENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_submenu_text_receive)],
@@ -1119,11 +1358,15 @@ def main():
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("contact", contact_cmd))
     app.add_handler(CommandHandler("clear", clear_chat))
+    app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CallbackQueryHandler(
         admin_cb_dispatch,
-        pattern=r"^(admhome|admtoggleglass|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|admcolor_|admcolorset_|noop)",
+        pattern=r"^(admhome|admtoggleglass|admstats|admlog|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|admcolor_|admcolorset_|noop)",
     ))
-    app.add_handler(CallbackQueryHandler(user_cb_dispatch, pattern=r"^(ucat_\d+|uhome|ucontact)$"))
+    app.add_handler(CallbackQueryHandler(
+        user_cb_dispatch,
+        pattern=r"^(ucat_\d+|uhome|ucontact|usearch|umenu_\d+_\d+)$",
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
