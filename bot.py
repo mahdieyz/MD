@@ -9,6 +9,7 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BotCommand,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -55,16 +56,19 @@ db = Database()
 # Conversation states
 (
     ADD_BTN,
+    ADD_BTN_COLOR,
     RENAME_BTN,
+    RENAME_BTN_COLOR,
     UPLOAD_FILE,
     UPLOAD_NOTE,
     ADD_TEXT,
     SET_CONTACT,
     SET_WELCOME,
     SET_MENU_TEXT,
+    SET_SUBMENU_TEXT,
     BROADCAST,
     RESTORE_DB,
-) = range(10)
+) = range(13)
 
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
 ADMIN_BTN = "🔧 پنل مدیریت"
@@ -75,6 +79,7 @@ GLASS_MODE_KEY = "glass_mode"
 WELCOME_TEXT_KEY = "welcome_text"
 CONTACT_TEXT_KEY = "contact_text"
 MAIN_MENU_TEXT_KEY = "main_menu_text"
+SUBMENU_TEXT_KEY = "submenu_text"
 
 WELCOME_TEXT_DEFAULT = (
     "سلام {name} عزیز 👋\n\n"
@@ -84,10 +89,26 @@ WELCOME_TEXT_DEFAULT = (
 MAIN_MENU_TEXT_DEFAULT = "لطفاً یک گزینه را انتخاب کنید:"
 CONTACT_TEXT_DEFAULT = "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000"
 
-# Telegram requires every message to have at least 1 character, so for any
-# NON-root menu we use an invisible character instead of a visible
-# header/title line. Visually the user only sees the buttons - no message.
 SUBMENU_PLACEHOLDER = "\u2063"
+CLEAR_SENTINEL = "-"
+
+# Color tagging for buttons (Telegram has no real button-color API, so we
+# fake it with a leading colored-circle emoji in the button title).
+COLOR_EMOJIS = {
+    "red": "🔴",
+    "orange": "🟠",
+    "yellow": "🟡",
+    "green": "🟢",
+    "blue": "🔵",
+    "purple": "🟣",
+    "brown": "🟤",
+    "black": "⚫",
+    "white": "⚪",
+    "none": "",
+}
+COLOR_PREFIX_CHARS = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫", "⚪"]
+
+MAX_TRACKED_MESSAGES = 500
 
 
 def is_admin(user_id: int) -> bool:
@@ -110,12 +131,92 @@ def get_contact_text() -> str:
     return db.get_setting(CONTACT_TEXT_KEY, CONTACT_TEXT_DEFAULT)
 
 
+def get_submenu_text() -> str:
+    val = db.get_setting(SUBMENU_TEXT_KEY, "")
+    if not val or not val.strip():
+        return SUBMENU_PLACEHOLDER
+    return val
+
+
+def strip_color(title: str) -> str:
+    t = title.strip()
+    for emoji in COLOR_PREFIX_CHARS:
+        if t.startswith(emoji):
+            return t[len(emoji):].strip()
+    return t
+
+
+def _tree_row_label(title: str) -> str:
+    for emoji in COLOR_PREFIX_CHARS:
+        if title.startswith(emoji):
+            return title
+    return f"📂 {title}"
+
+
+def color_picker_kb(callback_prefix: str, cancel_callback: str) -> InlineKeyboardMarkup:
+    colors = [(k, v) for k, v in COLOR_EMOJIS.items() if k != "none"]
+    rows = []
+    row = []
+    for key, emoji in colors:
+        row.append(InlineKeyboardButton(emoji, callback_data=f"{callback_prefix}_{key}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🚫 بدون رنگ", callback_data=f"{callback_prefix}_none")])
+    rows.append([InlineKeyboardButton("❌ انصراف", callback_data=cancel_callback)])
+    return InlineKeyboardMarkup(rows)
+
+
 async def safe_edit(query, text, reply_markup=None, parse_mode=None):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
         if "message is not modified" not in str(e).lower():
             raise
+
+
+# ============================================================
+# Message tracking (for /clear) + tracked send helpers
+# ============================================================
+
+async def track_message(context, message):
+    if message is None:
+        return
+    ids = context.chat_data.setdefault("msg_ids", [])
+    ids.append(message.message_id)
+    if len(ids) > MAX_TRACKED_MESSAGES:
+        del ids[: len(ids) - MAX_TRACKED_MESSAGES]
+
+
+async def send_text(context, chat_id, text, **kwargs):
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    await track_message(context, msg)
+    return msg
+
+
+async def send_photo(context, chat_id, photo, **kwargs):
+    msg = await context.bot.send_photo(chat_id=chat_id, photo=photo, **kwargs)
+    await track_message(context, msg)
+    return msg
+
+
+async def send_document(context, chat_id, document, **kwargs):
+    msg = await context.bot.send_document(chat_id=chat_id, document=document, **kwargs)
+    await track_message(context, msg)
+    return msg
+
+
+async def reply_text(update, context, text, **kwargs):
+    msg = await update.message.reply_text(text, **kwargs)
+    await track_message(context, msg)
+    return msg
+
+
+async def track_incoming(update, context):
+    if update.message:
+        await track_message(context, update.message)
 
 
 # ============================================================
@@ -145,21 +246,21 @@ def build_menu_kb(parent_id: int, user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-async def _send_section_items(bot, chat_id, items):
+async def _send_section_items(context, chat_id, items):
     for item in items:
         ftype = item["file_type"]
         if ftype == "text":
-            await bot.send_message(chat_id=chat_id, text=item["note"] or "")
+            await send_text(context, chat_id, item["note"] or "")
         elif ftype == "photo":
-            await bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=item["note"] or None)
+            await send_photo(context, chat_id, item["file_id"], caption=item["note"] or None)
         else:
-            await bot.send_document(chat_id=chat_id, document=item["file_id"], caption=item["note"] or None)
+            await send_document(context, chat_id, item["file_id"], caption=item["note"] or None)
 
 
-async def show_menu(bot, chat_id, parent_id, user_id):
+async def show_menu(context, chat_id, parent_id, user_id):
     kb = build_menu_kb(parent_id, user_id)
-    text = get_main_menu_text() if parent_id == 0 else SUBMENU_PLACEHOLDER
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    text = get_main_menu_text() if parent_id == 0 else get_submenu_text()
+    await send_text(context, chat_id, text, reply_markup=kb)
 
 
 async def enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE, button):
@@ -169,9 +270,9 @@ async def enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE, butto
 
     items = db.get_catalogs(button["id"])
     if items:
-        await _send_section_items(context.bot, chat_id, items)
+        await _send_section_items(context, chat_id, items)
 
-    await show_menu(context.bot, chat_id, button["id"], user_id)
+    await show_menu(context, chat_id, button["id"], user_id)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,18 +284,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == ADMIN_BTN and is_admin(user_id):
             await admin_cmd(update, context)
             return
-        await update.message.reply_text(
+        await reply_text(
+            update, context,
             "لطفاً از دکمه‌های شیشه‌ای بالا استفاده کنید. برای شروع دوباره /start را بزنید."
         )
         return
 
     if text == BACK_HOME_BTN:
         context.user_data["parent_id"] = 0
-        await show_menu(context.bot, chat_id, 0, user_id)
+        await show_menu(context, chat_id, 0, user_id)
         return
 
     if text == CONTACT_BTN:
-        await update.message.reply_text(get_contact_text())
+        await reply_text(update, context, get_contact_text())
         return
 
     if text == ADMIN_BTN:
@@ -212,10 +314,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not button:
         context.user_data["parent_id"] = 0
-        await show_menu(context.bot, chat_id, 0, user_id)
+        await show_menu(context, chat_id, 0, user_id)
         return
 
     await enter_button(update, context, button)
+
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    context.user_data["parent_id"] = 0
+    if is_glass_mode():
+        kb = build_menu_inline_kb(0, user_id)
+        await send_text(context, chat_id, get_main_menu_text(), reply_markup=kb)
+    else:
+        await show_menu(context, chat_id, 0, user_id)
+
+
+async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await send_text(context, chat_id, get_contact_text())
+
+
+async def clear_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ids = context.chat_data.get("msg_ids", [])
+    deleted = 0
+    for mid in list(ids):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception:
+            pass
+    context.chat_data["msg_ids"] = []
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    notice = await context.bot.send_message(chat_id=chat_id, text=f"🧹 چت پاک شد. ({deleted} پیام حذف شد)")
+    await track_message(context, notice)
 
 
 # ============================================================
@@ -274,13 +413,14 @@ async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         items = db.get_catalogs(button_id)
         if items:
-            await _send_section_items(context.bot, chat_id, items)
+            await _send_section_items(context, chat_id, items)
 
         kb = build_menu_inline_kb(button_id, user_id)
+        text = get_submenu_text()
         try:
-            await safe_edit(query, SUBMENU_PLACEHOLDER, reply_markup=kb)
+            await safe_edit(query, text, reply_markup=kb)
         except BadRequest:
-            await context.bot.send_message(chat_id=chat_id, text=SUBMENU_PLACEHOLDER, reply_markup=kb)
+            await send_text(context, chat_id, text, reply_markup=kb)
         return
 
 
@@ -294,12 +434,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if is_glass_mode():
-        await context.bot.send_message(chat_id=chat_id, text=welcome)
+        await send_text(context, chat_id, welcome)
         kb = build_menu_inline_kb(0, user.id)
-        await context.bot.send_message(chat_id=chat_id, text=get_main_menu_text(), reply_markup=kb)
+        await send_text(context, chat_id, get_main_menu_text(), reply_markup=kb)
     else:
         kb = build_menu_kb(0, user.id)
-        await context.bot.send_message(chat_id=chat_id, text=welcome, reply_markup=kb)
+        await send_text(context, chat_id, welcome, reply_markup=kb)
 
 
 # ============================================================
@@ -310,7 +450,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         if update.message:
-            await update.message.reply_text("⛔ شما دسترسی ادمین ندارید.")
+            await reply_text(update, context, "⛔ شما دسترسی ادمین ندارید.")
         return
 
     _clear_conv_keys(context)
@@ -320,7 +460,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await safe_edit(update.callback_query, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await reply_text(update, context, text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 def admin_home_text() -> str:
@@ -341,6 +481,7 @@ def admin_home_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(glass_label, callback_data="admtoggleglass")],
         [InlineKeyboardButton("👋 پیام خوش‌آمدگویی", callback_data="admwelcome")],
         [InlineKeyboardButton("🏠 متن سربرگ منوی اصلی", callback_data="admmenutext")],
+        [InlineKeyboardButton("📂 متن سربرگ زیرمنوها", callback_data="admsubmenutext")],
         [InlineKeyboardButton("📞 تنظیم متن تماس", callback_data="admcontact")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="admbroadcast")],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="admbackup")],
@@ -355,9 +496,10 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
     buttons = db.get_buttons(parent_id)
     rows = []
     for b in buttons:
-        rows.append([InlineKeyboardButton(f"📂 {b['title']}", callback_data=f"admtree_{b['id']}")])
+        rows.append([InlineKeyboardButton(_tree_row_label(b["title"]), callback_data=f"admtree_{b['id']}")])
         rows.append([
             InlineKeyboardButton("✏️", callback_data=f"admrenamebtn_{b['id']}"),
+            InlineKeyboardButton("🎨", callback_data=f"admcolor_{b['id']}"),
             InlineKeyboardButton("🗑️", callback_data=f"admdelbtn_{b['id']}"),
             InlineKeyboardButton("⬆️", callback_data=f"admmoveup_{b['id']}"),
             InlineKeyboardButton("⬇️", callback_data=f"admmovedown_{b['id']}"),
@@ -449,7 +591,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.backup_to_file(target)
         with open(target, "rb") as f:
-            await context.bot.send_document(chat_id=query.message.chat_id, document=f, filename=os.path.basename(target))
+            await send_document(context, query.message.chat_id, f, filename=os.path.basename(target))
         await query.answer("✅ بکاپ ارسال شد")
         return
 
@@ -532,6 +674,31 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(query, f"⚠️ آیا از حذف «{button['title']}» و تمام زیرمجموعه‌های آن مطمئن هستید؟", reply_markup=kb)
         return
 
+    if data.startswith("admcolorset_"):
+        rest = data[len("admcolorset_"):]
+        button_id_str, color_key = rest.rsplit("_", 1)
+        button_id = int(button_id_str)
+        button = db.get_button(button_id)
+        if not button:
+            await query.answer("یافت نشد", show_alert=True)
+            return
+        base_title = strip_color(button["title"])
+        emoji = COLOR_EMOJIS.get(color_key, "")
+        new_title = f"{emoji} {base_title}".strip() if emoji else base_title
+        db.rename_button(button_id, new_title)
+        await safe_edit(query, f"🌳 مدیریت منو\n{DIVIDER}", reply_markup=build_tree_kb(button["parent_id"]))
+        return
+
+    if data.startswith("admcolor_"):
+        button_id = int(data.split("_", 1)[1])
+        button = db.get_button(button_id)
+        if not button:
+            await query.answer("یافت نشد", show_alert=True)
+            return
+        kb = color_picker_kb(f"admcolorset_{button_id}", f"admtree_{button['parent_id']}")
+        await safe_edit(query, f"🎨 انتخاب رنگ برای «{strip_color(button['title'])}»:", reply_markup=kb)
+        return
+
     if data == "noop":
         return
 
@@ -549,6 +716,7 @@ def _clear_conv_keys(context):
         "upload_file_name",
         "upload_file_type",
         "text_button_id",
+        "pending_title",
     ):
         context.user_data.pop(key, None)
 
@@ -565,13 +733,27 @@ async def prompt_add_btn(update, context):
 
 async def save_new_btn(update, context):
     title = update.message.text.strip()
-    parent_id = context.user_data.get("target_parent_id", 0)
     if not title:
-        await update.message.reply_text("⚠️ نام نباید خالی باشد. دوباره ارسال کنید:")
+        await reply_text(update, context, "⚠️ نام نباید خالی باشد. دوباره ارسال کنید:")
         return ADD_BTN
-    db.add_button(title, parent_id)
+    context.user_data["pending_title"] = title
+    parent_id = context.user_data.get("target_parent_id", 0)
+    kb = color_picker_kb("newcolor", f"admtree_{parent_id}")
+    await reply_text(update, context, "🎨 رنگ دکمه را انتخاب کنید:", reply_markup=kb)
+    return ADD_BTN_COLOR
+
+
+async def save_new_btn_color(update, context):
+    query = update.callback_query
+    await query.answer()
+    color_key = query.data.split("_", 1)[1]
+    emoji = COLOR_EMOJIS.get(color_key, "")
+    title = context.user_data.get("pending_title", "دکمه")
+    parent_id = context.user_data.get("target_parent_id", 0)
+    full_title = f"{emoji} {title}".strip() if emoji else title
+    db.add_button(full_title, parent_id)
     _clear_conv_keys(context)
-    await update.message.reply_text(f"✅ «{title}» اضافه شد.", reply_markup=build_tree_kb(parent_id))
+    await safe_edit(query, f"✅ «{full_title}» اضافه شد.", reply_markup=build_tree_kb(parent_id))
     return ConversationHandler.END
 
 
@@ -589,13 +771,29 @@ async def save_rename_btn(update, context):
     title = update.message.text.strip()
     button_id = context.user_data.get("rename_button_id")
     if not title or not button_id:
-        await update.message.reply_text("⚠️ خطا، دوباره تلاش کنید.")
+        await reply_text(update, context, "⚠️ خطا، دوباره تلاش کنید.")
         return ConversationHandler.END
-    db.rename_button(button_id, title)
+    context.user_data["pending_title"] = title
+    button = db.get_button(button_id)
+    parent_id = button["parent_id"] if button else 0
+    kb = color_picker_kb("renamecolor", f"admtree_{parent_id}")
+    await reply_text(update, context, "🎨 رنگ دکمه را انتخاب کنید:", reply_markup=kb)
+    return RENAME_BTN_COLOR
+
+
+async def save_rename_btn_color(update, context):
+    query = update.callback_query
+    await query.answer()
+    color_key = query.data.split("_", 1)[1]
+    emoji = COLOR_EMOJIS.get(color_key, "")
+    title = context.user_data.get("pending_title", "")
+    button_id = context.user_data.get("rename_button_id")
+    full_title = f"{emoji} {title}".strip() if emoji else title
+    db.rename_button(button_id, full_title)
     button = db.get_button(button_id)
     parent_id = button["parent_id"] if button else 0
     _clear_conv_keys(context)
-    await update.message.reply_text("✅ تغییر نام انجام شد.", reply_markup=build_tree_kb(parent_id))
+    await safe_edit(query, "✅ تغییر نام/رنگ انجام شد.", reply_markup=build_tree_kb(parent_id))
     return ConversationHandler.END
 
 
@@ -620,7 +818,7 @@ async def upload_file_receive(update, context):
         file_name = msg.document.file_name or "فایل"
         file_type = "document"
     else:
-        await msg.reply_text("⚠️ لطفاً یک فایل یا عکس ارسال کنید.")
+        await reply_text(update, context, "⚠️ لطفاً یک فایل یا عکس ارسال کنید.")
         return UPLOAD_FILE
 
     context.user_data["upload_file_id"] = file_id
@@ -628,7 +826,7 @@ async def upload_file_receive(update, context):
     context.user_data["upload_file_type"] = file_type
 
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ بدون توضیح", callback_data="admskipnote")]])
-    await msg.reply_text("📝 در صورت تمایل توضیح/کپشن ارسال کنید، یا دکمه زیر را بزنید:", reply_markup=kb)
+    await reply_text(update, context, "📝 در صورت تمایل توضیح/کپشن ارسال کنید، یا دکمه زیر را بزنید:", reply_markup=kb)
     return UPLOAD_NOTE
 
 
@@ -644,7 +842,8 @@ async def _finalize_upload(context, note, message=None, query=None):
     text = "✅ فایل اضافه شد."
     kb = build_tree_kb(button_id)
     if message:
-        await message.reply_text(text, reply_markup=kb)
+        msg = await message.reply_text(text, reply_markup=kb)
+        await track_message(context, msg)
     elif query:
         await safe_edit(query, text, reply_markup=kb)
     return ConversationHandler.END
@@ -675,11 +874,11 @@ async def save_new_text(update, context):
     content = update.message.text.strip()
     button_id = context.user_data.get("text_button_id")
     if not content:
-        await update.message.reply_text("⚠️ متن نباید خالی باشد.")
+        await reply_text(update, context, "⚠️ متن نباید خالی باشد.")
         return ADD_TEXT
     db.add_catalog_file(button_id, "", "متن", content, "text")
     _clear_conv_keys(context)
-    await update.message.reply_text("✅ متن اضافه شد.", reply_markup=build_tree_kb(button_id))
+    await reply_text(update, context, "✅ متن اضافه شد.", reply_markup=build_tree_kb(button_id))
     return ConversationHandler.END
 
 
@@ -698,7 +897,7 @@ async def prompt_contact(update, context):
 async def set_contact_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(CONTACT_TEXT_KEY, text)
-    await update.message.reply_text("✅ متن تماس بروزرسانی شد.", reply_markup=admin_home_kb())
+    await reply_text(update, context, "✅ متن تماس بروزرسانی شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
 
@@ -719,7 +918,8 @@ async def set_welcome_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(WELCOME_TEXT_KEY, text)
     preview = text.format(name=update.effective_user.first_name or "کاربر")
-    await update.message.reply_text(
+    await reply_text(
+        update, context,
         f"✅ متن خوش‌آمدگویی بروزرسانی شد.\n\n{DIVIDER}\nپیش‌نمایش:\n{preview}",
         reply_markup=admin_home_kb(),
     )
@@ -741,7 +941,38 @@ async def prompt_menu_text(update, context):
 async def set_menu_text_receive(update, context):
     text = update.message.text.strip()
     db.set_setting(MAIN_MENU_TEXT_KEY, text)
-    await update.message.reply_text("✅ متن سربرگ منوی اصلی بروزرسانی شد.", reply_markup=admin_home_kb())
+    await reply_text(update, context, "✅ متن سربرگ منوی اصلی بروزرسانی شد.", reply_markup=admin_home_kb())
+    return ConversationHandler.END
+
+
+async def prompt_submenu_text(update, context):
+    query = update.callback_query
+    await query.answer()
+    current = db.get_setting(SUBMENU_TEXT_KEY, "")
+    current_display = current if current.strip() else "(خالی - فقط دکمه‌ها نمایش داده می‌شود)"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="admhome")]])
+    await safe_edit(
+        query,
+        f"📂 متن فعلی سربرگ زیرمنوها:\n\n{current_display}\n\n{DIVIDER}\n"
+        "متن جدید را ارسال کنید.\n"
+        "برای حذف کامل متن (نمایش فقط دکمه‌ها بدون پیام) علامت - را ارسال کنید:",
+        reply_markup=kb,
+    )
+    return SET_SUBMENU_TEXT
+
+
+async def set_submenu_text_receive(update, context):
+    text = update.message.text.strip()
+    if text == CLEAR_SENTINEL:
+        db.set_setting(SUBMENU_TEXT_KEY, "")
+        await reply_text(
+            update, context,
+            "✅ متن سربرگ زیرمنوها حذف شد. از این پس فقط دکمه‌ها نمایش داده می‌شوند.",
+            reply_markup=admin_home_kb(),
+        )
+    else:
+        db.set_setting(SUBMENU_TEXT_KEY, text)
+        await reply_text(update, context, "✅ متن سربرگ زیرمنوها بروزرسانی شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
 
@@ -763,7 +994,7 @@ async def broadcast_receive(update, context):
             sent += 1
         except Exception:
             failed += 1
-    await msg.reply_text(f"✅ ارسال شد به {sent} کاربر.\n❌ ناموفق: {failed}", reply_markup=admin_home_kb())
+    await reply_text(update, context, f"✅ ارسال شد به {sent} کاربر.\n❌ ناموفق: {failed}", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
 
@@ -778,7 +1009,7 @@ async def prompt_restore(update, context):
 async def restore_db_receive(update, context):
     doc = update.message.document
     if not doc:
-        await update.message.reply_text("⚠️ لطفاً یک فایل ارسال کنید.")
+        await reply_text(update, context, "⚠️ لطفاً یک فایل ارسال کنید.")
         return RESTORE_DB
 
     file = await doc.get_file()
@@ -788,20 +1019,20 @@ async def restore_db_receive(update, context):
     try:
         db.restore_from_file(tmp_path)
     except Exception as e:
-        await update.message.reply_text(f"❌ بازیابی ناموفق بود: {e}")
+        await reply_text(update, context, f"❌ بازیابی ناموفق بود: {e}")
         return ConversationHandler.END
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    await update.message.reply_text("✅ بازیابی با موفقیت انجام شد.", reply_markup=admin_home_kb())
+    await reply_text(update, context, "✅ بازیابی با موفقیت انجام شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
 
 async def cancel(update, context):
     _clear_conv_keys(context)
     if update.message:
-        await update.message.reply_text("❌ عملیات لغو شد.")
+        await reply_text(update, context, "❌ عملیات لغو شد.")
     return ConversationHandler.END
 
 
@@ -816,7 +1047,7 @@ async def conv_fallback_callback(update, context):
 
 async def conv_fallback_text(update, context):
     _clear_conv_keys(context)
-    await update.message.reply_text("❌ عملیات قبلی لغو شد.")
+    await reply_text(update, context, "❌ عملیات قبلی لغو شد.")
     return ConversationHandler.END
 
 
@@ -824,11 +1055,28 @@ async def error_handler(update, context):
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "شروع / بازگشت به منوی اصلی"),
+        BotCommand("menu", "نمایش منوی اصلی"),
+        BotCommand("contact", "تماس با ما"),
+        BotCommand("clear", "پاک کردن چت"),
+        BotCommand("admin", "پنل مدیریت (ادمین)"),
+        BotCommand("cancel", "لغو عملیات جاری"),
+    ])
+
+
 def main():
     persistence_path = os.path.join(os.path.dirname(DB_PATH) or ".", "bot_persistence.pickle")
     persistence = PicklePersistence(filepath=persistence_path)
 
-    app = Application.builder().token(TOKEN).persistence(persistence).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .post_init(post_init)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -839,12 +1087,15 @@ def main():
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
             CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
             CallbackQueryHandler(prompt_menu_text, pattern=r"^admmenutext$"),
+            CallbackQueryHandler(prompt_submenu_text, pattern=r"^admsubmenutext$"),
             CallbackQueryHandler(prompt_broadcast, pattern=r"^admbroadcast$"),
             CallbackQueryHandler(prompt_restore, pattern=r"^admrestore$"),
         ],
         states={
             ADD_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_btn)],
+            ADD_BTN_COLOR: [CallbackQueryHandler(save_new_btn_color, pattern=r"^newcolor_")],
             RENAME_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rename_btn)],
+            RENAME_BTN_COLOR: [CallbackQueryHandler(save_rename_btn_color, pattern=r"^renamecolor_")],
             UPLOAD_FILE: [MessageHandler(filters.PHOTO | filters.Document.ALL, upload_file_receive)],
             UPLOAD_NOTE: [
                 CallbackQueryHandler(upload_note_skip, pattern=r"^admskipnote$"),
@@ -854,6 +1105,7 @@ def main():
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             SET_MENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_menu_text_receive)],
+            SET_SUBMENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_submenu_text_receive)],
             BROADCAST: [MessageHandler(~filters.COMMAND, broadcast_receive)],
             RESTORE_DB: [MessageHandler(filters.Document.ALL, restore_db_receive)],
         },
@@ -869,13 +1121,18 @@ def main():
         persistent=True,
     )
 
+    app.add_handler(MessageHandler(filters.ALL, track_incoming), group=-1)
+
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("contact", contact_cmd))
+    app.add_handler(CommandHandler("clear", clear_chat))
     app.add_handler(CallbackQueryHandler(
         admin_cb_dispatch,
-        pattern=r"^(admhome|admtoggleglass|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|noop)",
+        pattern=r"^(admhome|admtoggleglass|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|admcolor_|admcolorset_|noop)",
     ))
     app.add_handler(CallbackQueryHandler(user_cb_dispatch, pattern=r"^(ucat_\d+|uhome|ucontact)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
