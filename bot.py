@@ -59,16 +59,14 @@ db = Database()
     ADD_BTN_COLOR,
     RENAME_BTN,
     RENAME_BTN_COLOR,
-    UPLOAD_FILE,
-    UPLOAD_NOTE,
-    ADD_TEXT,
+    ADD_CONTENT,
     SET_CONTACT,
     SET_WELCOME,
     SET_MENU_TEXT,
     SET_SUBMENU_TEXT,
     BROADCAST,
     RESTORE_DB,
-) = range(13)
+) = range(11)
 
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
 ADMIN_BTN = "🔧 پنل مدیریت"
@@ -507,8 +505,7 @@ def build_tree_kb(parent_id: int) -> InlineKeyboardMarkup:
         ])
 
     rows.append([InlineKeyboardButton("➕ افزودن دکمه/گروه", callback_data=f"admaddbtn_{parent_id}")])
-    rows.append([InlineKeyboardButton("📤 افزودن فایل به این بخش", callback_data=f"admaddfile_{parent_id}")])
-    rows.append([InlineKeyboardButton("📝 افزودن توضیحات متنی", callback_data=f"admaddtext_{parent_id}")])
+    rows.append([InlineKeyboardButton("➕ افزودن محتوا (متن/عکس/فایل)", callback_data=f"admaddcontent_{parent_id}")])
 
     if parent_id != 0:
         parent = db.get_button(parent_id)
@@ -539,8 +536,7 @@ async def _show_file_list(query, button_id):
             InlineKeyboardButton(_item_label(item), callback_data="noop"),
             InlineKeyboardButton("🗑️", callback_data=f"admdelfile_{item['id']}"),
         ])
-    rows.append([InlineKeyboardButton("📤 افزودن فایل", callback_data=f"admaddfile_{button_id}")])
-    rows.append([InlineKeyboardButton("📝 افزودن متن", callback_data=f"admaddtext_{button_id}")])
+    rows.append([InlineKeyboardButton("➕ افزودن محتوا", callback_data=f"admaddcontent_{button_id}")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"admtree_{button_id}")])
 
     text = "📄 محتوای این بخش:" if items else "این بخش هنوز محتوایی ندارد."
@@ -711,12 +707,10 @@ def _clear_conv_keys(context):
     for key in (
         "target_parent_id",
         "rename_button_id",
-        "upload_button_id",
-        "upload_file_id",
-        "upload_file_name",
-        "upload_file_type",
-        "text_button_id",
         "pending_title",
+        "content_button_id",
+        "content_added_count",
+        "content_status_msg_id",
     ):
         context.user_data.pop(key, None)
 
@@ -797,90 +791,83 @@ async def save_rename_btn_color(update, context):
     return ConversationHandler.END
 
 
-async def prompt_add_file(update, context):
+# ---- Bulk content add (text / photo / document, unlimited items) ----
+
+async def prompt_add_content(update, context):
     query = update.callback_query
     await query.answer()
     button_id = int(query.data.split("_", 1)[1])
-    context.user_data["upload_button_id"] = button_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data=f"admtree_{button_id}")]])
-    await safe_edit(query, "📤 فایل یا عکس موردنظر را ارسال کنید:", reply_markup=kb)
-    return UPLOAD_FILE
+    context.user_data["content_button_id"] = button_id
+    context.user_data["content_added_count"] = 0
+    context.user_data["content_status_msg_id"] = None
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان افزودن", callback_data="admfinishcontent")]])
+    await safe_edit(
+        query,
+        "➕ حالا می‌توانید هر تعداد عکس، فایل یا متن که می‌خواهید را پشت سر هم ارسال کنید.\n"
+        "هرکدام بلافاصله ذخیره می‌شود. وقتی تمام شد دکمه پایان را بزنید:",
+        reply_markup=kb,
+    )
+    return ADD_CONTENT
 
 
-async def upload_file_receive(update, context):
+async def _update_content_status(update, context):
+    chat_id = update.effective_chat.id
+    count = context.user_data.get("content_added_count", 0)
+    text = f"✅ تا کنون {count} مورد اضافه شد.\nمی‌توانید مورد بعدی را ارسال کنید یا پایان دهید."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان افزودن", callback_data="admfinishcontent")]])
+    status_msg_id = context.user_data.get("content_status_msg_id")
+
+    if status_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_msg_id, text=text, reply_markup=kb
+            )
+            return
+        except BadRequest:
+            pass
+
+    msg = await reply_text(update, context, text, reply_markup=kb)
+    context.user_data["content_status_msg_id"] = msg.message_id
+
+
+async def add_content_receive(update, context):
     msg = update.message
+    button_id = context.user_data.get("content_button_id")
+    if not button_id and button_id != 0:
+        await reply_text(update, context, "⚠️ خطا، دوباره از منو شروع کنید.")
+        return ConversationHandler.END
+
     if msg.photo:
         file_id = msg.photo[-1].file_id
-        file_name = "عکس"
-        file_type = "photo"
+        note = msg.caption or ""
+        db.add_catalog_file(button_id, file_id, "عکس", note, "photo")
     elif msg.document:
         file_id = msg.document.file_id
         file_name = msg.document.file_name or "فایل"
-        file_type = "document"
+        note = msg.caption or ""
+        db.add_catalog_file(button_id, file_id, file_name, note, "document")
+    elif msg.text and msg.text.strip():
+        db.add_catalog_file(button_id, "", "متن", msg.text.strip(), "text")
     else:
-        await reply_text(update, context, "⚠️ لطفاً یک فایل یا عکس ارسال کنید.")
-        return UPLOAD_FILE
+        await reply_text(update, context, "⚠️ این نوع پیام پشتیبانی نمی‌شود. عکس، فایل یا متن ارسال کنید.")
+        return ADD_CONTENT
 
-    context.user_data["upload_file_id"] = file_id
-    context.user_data["upload_file_name"] = file_name
-    context.user_data["upload_file_type"] = file_type
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ بدون توضیح", callback_data="admskipnote")]])
-    await reply_text(update, context, "📝 در صورت تمایل توضیح/کپشن ارسال کنید، یا دکمه زیر را بزنید:", reply_markup=kb)
-    return UPLOAD_NOTE
+    context.user_data["content_added_count"] = context.user_data.get("content_added_count", 0) + 1
+    await _update_content_status(update, context)
+    return ADD_CONTENT
 
 
-async def _finalize_upload(context, note, message=None, query=None):
-    button_id = context.user_data.get("upload_button_id")
-    file_id = context.user_data.get("upload_file_id")
-    file_name = context.user_data.get("upload_file_name")
-    file_type = context.user_data.get("upload_file_type")
-
-    db.add_catalog_file(button_id, file_id, file_name, note, file_type)
+async def finish_add_content(update, context):
+    query = update.callback_query
+    await query.answer()
+    button_id = context.user_data.get("content_button_id", 0)
+    count = context.user_data.get("content_added_count", 0)
     _clear_conv_keys(context)
-
-    text = "✅ فایل اضافه شد."
-    kb = build_tree_kb(button_id)
-    if message:
-        msg = await message.reply_text(text, reply_markup=kb)
-        await track_message(context, msg)
-    elif query:
-        await safe_edit(query, text, reply_markup=kb)
+    await safe_edit(query, f"✅ افزودن محتوا پایان یافت. ({count} مورد اضافه شد)", reply_markup=build_tree_kb(button_id))
     return ConversationHandler.END
 
 
-async def upload_note_skip(update, context):
-    query = update.callback_query
-    await query.answer()
-    return await _finalize_upload(context, note="", query=query)
-
-
-async def upload_note_receive(update, context):
-    note = update.message.text.strip()
-    return await _finalize_upload(context, note=note, message=update.message)
-
-
-async def prompt_add_text(update, context):
-    query = update.callback_query
-    await query.answer()
-    button_id = int(query.data.split("_", 1)[1])
-    context.user_data["text_button_id"] = button_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data=f"admtree_{button_id}")]])
-    await safe_edit(query, "📝 متن موردنظر را ارسال کنید:", reply_markup=kb)
-    return ADD_TEXT
-
-
-async def save_new_text(update, context):
-    content = update.message.text.strip()
-    button_id = context.user_data.get("text_button_id")
-    if not content:
-        await reply_text(update, context, "⚠️ متن نباید خالی باشد.")
-        return ADD_TEXT
-    db.add_catalog_file(button_id, "", "متن", content, "text")
-    _clear_conv_keys(context)
-    await reply_text(update, context, "✅ متن اضافه شد.", reply_markup=build_tree_kb(button_id))
-    return ConversationHandler.END
-
+# ---- Simple text settings ----
 
 async def prompt_contact(update, context):
     query = update.callback_query
@@ -1082,8 +1069,7 @@ def main():
         entry_points=[
             CallbackQueryHandler(prompt_add_btn, pattern=r"^admaddbtn_"),
             CallbackQueryHandler(prompt_rename_btn, pattern=r"^admrenamebtn_"),
-            CallbackQueryHandler(prompt_add_file, pattern=r"^admaddfile_"),
-            CallbackQueryHandler(prompt_add_text, pattern=r"^admaddtext_"),
+            CallbackQueryHandler(prompt_add_content, pattern=r"^admaddcontent_"),
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
             CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
             CallbackQueryHandler(prompt_menu_text, pattern=r"^admmenutext$"),
@@ -1096,12 +1082,13 @@ def main():
             ADD_BTN_COLOR: [CallbackQueryHandler(save_new_btn_color, pattern=r"^newcolor_")],
             RENAME_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rename_btn)],
             RENAME_BTN_COLOR: [CallbackQueryHandler(save_rename_btn_color, pattern=r"^renamecolor_")],
-            UPLOAD_FILE: [MessageHandler(filters.PHOTO | filters.Document.ALL, upload_file_receive)],
-            UPLOAD_NOTE: [
-                CallbackQueryHandler(upload_note_skip, pattern=r"^admskipnote$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, upload_note_receive),
+            ADD_CONTENT: [
+                CallbackQueryHandler(finish_add_content, pattern=r"^admfinishcontent$"),
+                MessageHandler(
+                    (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+                    add_content_receive,
+                ),
             ],
-            ADD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_text)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
             SET_MENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_menu_text_receive)],
