@@ -65,9 +65,10 @@ if not TOKEN:
     ADD_TEXT,
     SET_CONTACT,
     SET_WELCOME,
+    SET_MENU_TEXT,
     BROADCAST,
     RESTORE_DB,
-) = range(9)
+) = range(10)
 
 # ---------- constants ----------
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
@@ -75,13 +76,20 @@ ADMIN_BTN = "🔧 پنل مدیریت"
 BACK_HOME_BTN = "🔙 بازگشت به منوی اصلی"
 DIVIDER = "➖➖➖➖➖➖➖➖➖➖"
 
-GLASS_MODE_KEY = "glass_mode"  # "on" / "off"
+GLASS_MODE_KEY = "glass_mode"          # "on" / "off"
+WELCOME_TEXT_KEY = "welcome_text"
+CONTACT_TEXT_KEY = "contact_text"
+MAIN_MENU_TEXT_KEY = "main_menu_text"  # header shown above the root menu
 
 WELCOME_TEXT_DEFAULT = (
     "سلام {name} عزیز 👋\n\n"
-    "به ربات شرکت توان سازه خوش آمدید.\n"
-    "از منوی زیر محصول موردنظر خود را انتخاب کنید."
+    "خوش آمدید.\n"
+    "از منوی زیر گزینه موردنظر خود را انتخاب کنید."
 )
+
+MAIN_MENU_TEXT_DEFAULT = "لطفاً یک گزینه را انتخاب کنید:"
+
+CONTACT_TEXT_DEFAULT = "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000"
 
 
 def is_admin(user_id: int) -> bool:
@@ -90,6 +98,10 @@ def is_admin(user_id: int) -> bool:
 
 def is_glass_mode() -> bool:
     return db.get_setting(GLASS_MODE_KEY, "off") == "on"
+
+
+def get_main_menu_text() -> str:
+    return db.get_setting(MAIN_MENU_TEXT_KEY, MAIN_MENU_TEXT_DEFAULT)
 
 
 async def safe_edit(query, text, reply_markup=None):
@@ -130,10 +142,10 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, parent_i
     context.user_data["parent_id"] = parent_id
     kb = build_menu_kb(parent_id, update.effective_user.id)
     if parent_id == 0:
-        text = "🏠 منوی اصلی"
+        text = get_main_menu_text()
     else:
         btn = db.get_button(parent_id)
-        text = f"📂 {btn['title']}" if btn else "منو"
+        text = f"📂 {btn['title']}" if btn else get_main_menu_text()
     await update.message.reply_text(text, reply_markup=kb)
 
 
@@ -203,14 +215,11 @@ async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if data == "uhome":
-        await safe_edit(query, "🏠 منوی اصلی", reply_markup=build_menu_inline_kb(0, user_id))
+        await safe_edit(query, get_main_menu_text(), reply_markup=build_menu_inline_kb(0, user_id))
         return
 
     if data == "ucontact":
-        contact_text = db.get_setting(
-            "contact_text",
-            "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000",
-        )
+        contact_text = db.get_setting(CONTACT_TEXT_KEY, CONTACT_TEXT_DEFAULT)
         await context.bot.send_message(chat_id=chat_id, text=contact_text)
         return
 
@@ -245,13 +254,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_user(user.id, user.username, user.first_name)
     context.user_data["parent_id"] = 0
 
-    template = db.get_setting("welcome_text", WELCOME_TEXT_DEFAULT)
+    template = db.get_setting(WELCOME_TEXT_KEY, WELCOME_TEXT_DEFAULT)
     text = template.replace("{name}", user.first_name or "")
 
     if is_glass_mode():
         await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
         kb = build_menu_inline_kb(0, user.id)
-        await update.message.reply_text("لطفاً یک گزینه را انتخاب کنید 👇", reply_markup=kb)
+        await update.message.reply_text(get_main_menu_text(), reply_markup=kb)
     else:
         kb = build_menu_kb(0, user.id)
         await update.message.reply_text(text, reply_markup=kb)
@@ -266,10 +275,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == CONTACT_BTN:
-        contact_text = db.get_setting(
-            "contact_text",
-            "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000",
-        )
+        contact_text = db.get_setting(CONTACT_TEXT_KEY, CONTACT_TEXT_DEFAULT)
         await update.message.reply_text(contact_text)
         return
 
@@ -280,10 +286,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_glass_mode():
         # In glass mode, navigation happens via inline buttons, not typed text.
         kb = build_menu_inline_kb(0, user_id)
-        await update.message.reply_text(
-            "برای حرکت در منو از دکمه‌های شیشه‌ای زیر پیام استفاده کنید 👇",
-            reply_markup=kb,
-        )
+        await update.message.reply_text(get_main_menu_text(), reply_markup=kb)
         return
 
     current_parent = context.user_data.get("parent_id", 0)
@@ -299,7 +302,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["parent_id"] = current_parent
 
     if not btn:
-        await update.message.reply_text("متوجه نشدم 🤔 منوی اصلی را برایتان باز کردم.")
+        await update.message.reply_text("متوجه نشدم 🤔")
         await show_menu(update, context, 0)
         return
 
@@ -315,13 +318,13 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("⛔ دسترسی ندارید.")
         return
-    await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb())
+    await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
 
 
 def admin_home_text() -> str:
     mode = "🪟 شیشه‌ای (فعال)" if is_glass_mode() else "⌨️ کیبورد معمولی (فعال)"
     return (
-        "🔧 <b>پنل مدیریت ربات توان سازه</b>\n"
+        "🔧 <b>پنل مدیریت</b>\n"
         f"{DIVIDER}\n"
         f"حالت نمایش منو: {mode}\n"
         "از گزینه‌های زیر استفاده کنید:"
@@ -334,6 +337,7 @@ def admin_home_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🌳 مدیریت منو", callback_data="admtree_0")],
         [InlineKeyboardButton(glass_label, callback_data="admtoggleglass")],
         [InlineKeyboardButton("👋 پیام خوش‌آمدگویی", callback_data="admwelcome")],
+        [InlineKeyboardButton("🏠 متن سربرگ منوی اصلی", callback_data="admmenutext")],
         [InlineKeyboardButton("📞 تنظیم متن تماس", callback_data="admcontact")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="admbroadcast")],
         [InlineKeyboardButton("💾 بکاپ دیتابیس", callback_data="admbackup")],
@@ -670,13 +674,13 @@ async def save_new_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def prompt_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    current = db.get_setting("contact_text", "تنظیم نشده")
+    current = db.get_setting(CONTACT_TEXT_KEY, CONTACT_TEXT_DEFAULT)
     await query.edit_message_text(f"📞 متن فعلی:\n\n{current}\n\nمتن جدید را ارسال کنید:\n(برای لغو /cancel)")
     return SET_CONTACT
 
 
 async def set_contact_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.set_setting("contact_text", update.message.text)
+    db.set_setting(CONTACT_TEXT_KEY, update.message.text)
     await update.message.reply_text("✅ متن تماس بروزرسانی شد.", reply_markup=admin_home_kb())
     return ConversationHandler.END
 
@@ -684,7 +688,7 @@ async def set_contact_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def prompt_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    current = db.get_setting("welcome_text", WELCOME_TEXT_DEFAULT)
+    current = db.get_setting(WELCOME_TEXT_KEY, WELCOME_TEXT_DEFAULT)
     await query.edit_message_text(
         "👋 پیام خوش‌آمدگویی فعلی (نمایش داده‌شده با /start):\n\n"
         f"{current}\n\n"
@@ -701,9 +705,33 @@ async def set_welcome_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("متن نمی‌تواند خالی باشد. دوباره ارسال کنید یا /cancel")
         return SET_WELCOME
 
-    db.set_setting("welcome_text", new_text)
+    db.set_setting(WELCOME_TEXT_KEY, new_text)
     preview = new_text.replace("{name}", update.effective_user.first_name or "")
     await update.message.reply_text("✅ پیام خوش‌آمدگویی بروزرسانی شد.\n\nپیش‌نمایش:\n\n" + preview)
+    await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
+    return ConversationHandler.END
+
+
+async def prompt_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current = get_main_menu_text()
+    await query.edit_message_text(
+        "🏠 متن فعلی سربرگ منوی اصلی (بالای دکمه‌های منو):\n\n"
+        f"{current}\n\n"
+        "متن جدید را ارسال کنید:\n(برای لغو /cancel)"
+    )
+    return SET_MENU_TEXT
+
+
+async def set_menu_text_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_text = update.message.text
+    if not new_text or not new_text.strip():
+        await update.message.reply_text("متن نمی‌تواند خالی باشد. دوباره ارسال کنید یا /cancel")
+        return SET_MENU_TEXT
+
+    db.set_setting(MAIN_MENU_TEXT_KEY, new_text)
+    await update.message.reply_text("✅ متن سربرگ منوی اصلی بروزرسانی شد.")
     await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
     return ConversationHandler.END
 
@@ -822,6 +850,7 @@ def main():
             CallbackQueryHandler(prompt_add_text, pattern=r"^admaddtext_"),
             CallbackQueryHandler(prompt_contact, pattern=r"^admcontact$"),
             CallbackQueryHandler(prompt_welcome, pattern=r"^admwelcome$"),
+            CallbackQueryHandler(prompt_menu_text, pattern=r"^admmenutext$"),
             CallbackQueryHandler(prompt_broadcast, pattern=r"^admbroadcast$"),
             CallbackQueryHandler(prompt_restore, pattern=r"^admrestore$"),
         ],
@@ -833,6 +862,7 @@ def main():
             ADD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_text)],
             SET_CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_contact_receive)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_receive)],
+            SET_MENU_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_menu_text_receive)],
             BROADCAST: [MessageHandler(~filters.COMMAND, broadcast_receive)],
             RESTORE_DB: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, restore_db_receive)],
         },
