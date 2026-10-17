@@ -5,9 +5,11 @@ from datetime import datetime
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -71,6 +73,9 @@ if not TOKEN:
 CONTACT_BTN = "🛒 ثبت سفارش / تماس با ما"
 ADMIN_BTN = "🔧 پنل مدیریت"
 BACK_HOME_BTN = "🔙 بازگشت به منوی اصلی"
+DIVIDER = "➖➖➖➖➖➖➖➖➖➖"
+
+GLASS_MODE_KEY = "glass_mode"  # "on" / "off"
 
 WELCOME_TEXT_DEFAULT = (
     "سلام {name} عزیز 👋\n\n"
@@ -83,14 +88,26 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def is_glass_mode() -> bool:
+    return db.get_setting(GLASS_MODE_KEY, "off") == "on"
+
+
+async def safe_edit(query, text, reply_markup=None):
+    """Edit a message, silently ignoring the harmless 'message is not modified' error."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
 # =========================================================
-# USER-FACING MENU
+# USER-FACING MENU — REPLY KEYBOARD MODE (classic)
 # =========================================================
 
 def build_menu_kb(parent_id: int, user_id: int = None) -> ReplyKeyboardMarkup:
     buttons = db.get_buttons(parent_id)
-    rows = []
-    row = []
+    rows, row = [], []
     for b in buttons:
         row.append(b["title"])
         if len(row) == 2:
@@ -113,41 +130,115 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, parent_i
     context.user_data["parent_id"] = parent_id
     kb = build_menu_kb(parent_id, update.effective_user.id)
     if parent_id == 0:
-        text = "منوی اصلی:"
+        text = "🏠 منوی اصلی"
     else:
         btn = db.get_button(parent_id)
-        text = btn["title"] if btn else "منو"
+        text = f"📂 {btn['title']}" if btn else "منو"
     await update.message.reply_text(text, reply_markup=kb)
+
+
+async def _send_section_items(bot, chat_id, items):
+    for item in items:
+        try:
+            ftype = item.get("file_type")
+            if ftype == "text":
+                content = (item.get("note") or "").strip()
+                if content:
+                    await bot.send_message(chat_id=chat_id, text=content)
+            elif ftype == "photo":
+                caption = item.get("note") or item.get("file_name") or ""
+                await bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=caption)
+            else:
+                caption = item.get("note") or item.get("file_name") or ""
+                await bot.send_document(chat_id=chat_id, document=item["file_id"], caption=caption)
+        except Exception:
+            logger.exception("Failed to send item id=%s", item.get("id"))
 
 
 async def enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE, btn: dict):
     button_id = btn["id"]
     items = db.get_catalogs(button_id)
 
-    for item in items:
-        try:
-            ftype = item.get("file_type")
-            if ftype == "text":
-                content = item.get("note") or ""
-                if content.strip():
-                    await update.message.reply_text(content)
-            elif ftype == "photo":
-                caption = item.get("note") or item.get("file_name") or ""
-                await update.message.reply_photo(item["file_id"], caption=caption)
-            else:
-                caption = item.get("note") or item.get("file_name") or ""
-                await update.message.reply_document(item["file_id"], caption=caption)
-        except Exception:
-            logger.exception("Failed to send item id=%s", item.get("id"))
+    await _send_section_items(context.bot, update.effective_chat.id, items)
 
     children = db.get_buttons(button_id)
     if children:
         context.user_data["parent_id"] = button_id
         kb = build_menu_kb(button_id, update.effective_user.id)
-        await update.message.reply_text(btn["title"], reply_markup=kb)
+        await update.message.reply_text(f"📂 {btn['title']}", reply_markup=kb)
     elif not items:
-        await update.message.reply_text("محتوایی برای این بخش ثبت نشده است.")
+        await update.message.reply_text("ℹ️ محتوایی برای این بخش ثبت نشده است.")
 
+
+# =========================================================
+# USER-FACING MENU — INLINE "GLASS BUTTON" MODE
+# =========================================================
+
+def build_menu_inline_kb(parent_id: int, user_id: int = None) -> InlineKeyboardMarkup:
+    buttons = db.get_buttons(parent_id)
+    rows, row = [], []
+    for b in buttons:
+        row.append(InlineKeyboardButton(b["title"], callback_data=f"ucat_{b['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    if parent_id == 0:
+        rows.append([InlineKeyboardButton(CONTACT_BTN, callback_data="ucontact")])
+        if user_id and is_admin(user_id):
+            rows.append([InlineKeyboardButton(ADMIN_BTN, callback_data="admhome")])
+    else:
+        rows.append([InlineKeyboardButton(BACK_HOME_BTN, callback_data="uhome")])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def user_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await query.answer()
+
+    if data == "uhome":
+        await safe_edit(query, "🏠 منوی اصلی", reply_markup=build_menu_inline_kb(0, user_id))
+        return
+
+    if data == "ucontact":
+        contact_text = db.get_setting(
+            "contact_text",
+            "برای ثبت سفارش با شماره زیر تماس بگیرید:\n09120000000",
+        )
+        await context.bot.send_message(chat_id=chat_id, text=contact_text)
+        return
+
+    if data.startswith("ucat_"):
+        button_id = int(data.split("_")[1])
+        btn = db.get_button(button_id)
+        if not btn:
+            await safe_edit(query, "⚠️ این بخش دیگر موجود نیست.", reply_markup=build_menu_inline_kb(0, user_id))
+            return
+
+        items = db.get_catalogs(button_id)
+        await _send_section_items(context.bot, chat_id, items)
+
+        children = db.get_buttons(button_id)
+        if children:
+            await safe_edit(query, f"📂 {btn['title']}", reply_markup=build_menu_inline_kb(button_id, user_id))
+        else:
+            back_kb = InlineKeyboardMarkup([[InlineKeyboardButton(BACK_HOME_BTN, callback_data="uhome")]])
+            if items:
+                await safe_edit(query, f"📂 {btn['title']}", reply_markup=back_kb)
+            else:
+                await safe_edit(query, f"📂 {btn['title']}\n\nℹ️ محتوایی برای این بخش ثبت نشده است.", reply_markup=back_kb)
+        return
+
+
+# =========================================================
+# SHARED START / MESSAGE HANDLING
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -156,8 +247,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     template = db.get_setting("welcome_text", WELCOME_TEXT_DEFAULT)
     text = template.replace("{name}", user.first_name or "")
-    kb = build_menu_kb(0, user.id)
-    await update.message.reply_text(text, reply_markup=kb)
+
+    if is_glass_mode():
+        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+        kb = build_menu_inline_kb(0, user.id)
+        await update.message.reply_text("لطفاً یک گزینه را انتخاب کنید 👇", reply_markup=kb)
+    else:
+        kb = build_menu_kb(0, user.id)
+        await update.message.reply_text(text, reply_markup=kb)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,14 +277,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_cmd(update, context)
         return
 
-    current_parent = context.user_data.get("parent_id", 0)
+    if is_glass_mode():
+        # In glass mode, navigation happens via inline buttons, not typed text.
+        kb = build_menu_inline_kb(0, user_id)
+        await update.message.reply_text(
+            "برای حرکت در منو از دکمه‌های شیشه‌ای زیر پیام استفاده کنید 👇",
+            reply_markup=kb,
+        )
+        return
 
+    current_parent = context.user_data.get("parent_id", 0)
     btn = db.get_button_by_title_parent(text, current_parent)
 
-    # Defensive self-heal: if the keyboard the user is looking at is stale
-    # (e.g. bot restarted and lost in-memory state, or user hasn't pressed
-    # anything in a while), try matching against the root menu before
-    # giving up.
+    # Defensive self-heal: stale keyboard (e.g. after restart) still resolves.
     if not btn and current_parent != 0:
         root_match = db.get_button_by_title_parent(text, 0)
         if root_match:
@@ -211,14 +313,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("دسترسی ندارید.")
+        await update.message.reply_text("⛔ دسترسی ندارید.")
         return
-    await update.message.reply_text("🔧 پنل مدیریت", reply_markup=admin_home_kb())
+    await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb())
+
+
+def admin_home_text() -> str:
+    mode = "🪟 شیشه‌ای (فعال)" if is_glass_mode() else "⌨️ کیبورد معمولی (فعال)"
+    return (
+        "🔧 <b>پنل مدیریت ربات توان سازه</b>\n"
+        f"{DIVIDER}\n"
+        f"حالت نمایش منو: {mode}\n"
+        "از گزینه‌های زیر استفاده کنید:"
+    )
 
 
 def admin_home_kb() -> InlineKeyboardMarkup:
+    glass_label = "⌨️ غیرفعال کردن دکمه شیشه‌ای" if is_glass_mode() else "🪟 فعال کردن دکمه شیشه‌ای"
     kb = [
         [InlineKeyboardButton("🌳 مدیریت منو", callback_data="admtree_0")],
+        [InlineKeyboardButton(glass_label, callback_data="admtoggleglass")],
         [InlineKeyboardButton("👋 پیام خوش‌آمدگویی", callback_data="admwelcome")],
         [InlineKeyboardButton("📞 تنظیم متن تماس", callback_data="admcontact")],
         [InlineKeyboardButton("📢 پیام همگانی", callback_data="admbroadcast")],
@@ -273,7 +387,7 @@ async def _show_file_list(query, button_id: int):
 
     rows = []
     if not items:
-        rows.append([InlineKeyboardButton("محتوایی موجود نیست", callback_data="noop")])
+        rows.append([InlineKeyboardButton("— محتوایی موجود نیست —", callback_data="noop")])
     for item in items:
         label = _item_label(item)
         rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"admdelfile_{item['id']}_{button_id}")])
@@ -283,7 +397,7 @@ async def _show_file_list(query, button_id: int):
     back_target = btn["parent_id"] if btn else 0
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"admtree_{back_target}")])
 
-    await query.edit_message_text(title, reply_markup=InlineKeyboardMarkup(rows))
+    await safe_edit(query, title, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +406,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not is_admin(user_id):
-        await query.answer("دسترسی ندارید.", show_alert=True)
+        await query.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
 
     await query.answer()
@@ -301,23 +415,31 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "admhome":
-        await query.edit_message_text("🔧 پنل مدیریت", reply_markup=admin_home_kb())
+        await query.edit_message_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
+        return
+
+    if data == "admtoggleglass":
+        new_value = "off" if is_glass_mode() else "on"
+        db.set_setting(GLASS_MODE_KEY, new_value)
+        await query.edit_message_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
         return
 
     if data == "admstats":
         stats = db.get_stats()
         breakdown = db.get_section_breakdown()
         lines = [
+            "📊 <b>آمار ربات</b>",
+            DIVIDER,
             f"👥 کاربران: {stats['users']}",
-            f"📁 فایل‌ها: {stats['files']}",
+            f"📁 فایل‌ها / متن‌ها: {stats['files']}",
             f"🔘 دکمه‌ها: {stats['buttons']}",
             "",
-            "تفکیک فایل‌ها بر اساس بخش:",
+            "تفکیک بر اساس بخش:",
         ]
         for row in breakdown:
-            lines.append(f"- {row['title']}: {row['count']}")
+            lines.append(f"• {row['title']}: {row['count']}")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admhome")]])
-        await query.edit_message_text("\n".join(lines), reply_markup=kb)
+        await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
         return
 
     if data == "admbackup":
@@ -338,8 +460,8 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ انصراف", callback_data="admhome")],
         ])
         await query.edit_message_text(
-            "⚠️ این کار تمام دکمه‌ها و فایل‌های منو را حذف و دسته‌بندی‌های پیش‌فرض را دوباره می‌سازد.\n"
-            "تنظیمات و کاربران شما حذف نمی‌شوند.\nادامه می‌دهید؟",
+            "⚠️ این کار تمام دکمه‌ها و محتوای منو را حذف و دسته‌بندی‌های پیش‌فرض را دوباره می‌سازد.\n"
+            "تنظیمات و کاربران شما حذف نمی‌شوند.\n\nادامه می‌دهید؟",
             reply_markup=kb,
         )
         return
@@ -352,8 +474,8 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admtree_"):
         parent_id = int(data.split("_")[1])
         parent = db.get_button(parent_id) if parent_id != 0 else None
-        title = f"🌳 مدیریت منو - {parent['title']}" if parent else "🌳 مدیریت منو - ریشه"
-        await query.edit_message_text(title, reply_markup=build_tree_kb(parent_id))
+        title = f"🌳 مدیریت منو — {parent['title']}" if parent else "🌳 مدیریت منو — ریشه"
+        await safe_edit(query, title, reply_markup=build_tree_kb(parent_id))
         return
 
     if data.startswith("admmoveup_") or data.startswith("admmovedown_"):
@@ -369,7 +491,6 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _show_file_list(query, button_id)
         return
 
-    # confirmation screen before deleting a file/text item
     if data.startswith("admdelfileyes_"):
         parts = data.split("_")
         catalog_id, button_id = int(parts[1]), int(parts[2])
@@ -386,10 +507,7 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"admdelfileyes_{catalog_id}_{button_id}")],
             [InlineKeyboardButton("❌ انصراف", callback_data=f"admfiles_{button_id}")],
         ])
-        await query.edit_message_text(
-            f"⚠️ آیا از حذف این مورد مطمئن هستید؟\n\n{label}",
-            reply_markup=kb,
-        )
+        await query.edit_message_text(f"⚠️ آیا از حذف این مورد مطمئن هستید؟\n\n{label}", reply_markup=kb)
         return
 
     if data.startswith("admdelbtnyes_"):
@@ -407,14 +525,14 @@ async def admin_cb_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ انصراف", callback_data=f"admtree_{parent_id}")],
         ])
         await query.edit_message_text(
-            "⚠️ این دکمه و تمام زیرمجموعه‌ها و فایل‌های آن حذف خواهد شد. مطمئن هستید؟",
+            "⚠️ این دکمه و تمام زیرمجموعه‌ها و محتوای آن حذف خواهد شد. مطمئن هستید؟",
             reply_markup=kb,
         )
         return
 
 
 # =========================================================
-# CONVERSATION FLOWS (add/rename button, upload file, add text, contact, welcome, broadcast, restore)
+# CONVERSATION FLOWS
 # =========================================================
 
 def _clear_conv_keys(context: ContextTypes.DEFAULT_TYPE):
@@ -431,7 +549,7 @@ async def prompt_add_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     parent_id = int(query.data.split("_")[1])
     context.user_data["add_parent"] = parent_id
-    await query.edit_message_text("نام دکمه/گروه جدید را ارسال کنید:\n(برای لغو /cancel)")
+    await query.edit_message_text("✏️ نام دکمه/گروه جدید را ارسال کنید:\n(برای لغو /cancel)")
     return ADD_BTN
 
 
@@ -456,7 +574,7 @@ async def prompt_rename_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     btn_id = int(query.data.split("_")[1])
     context.user_data["rename_id"] = btn_id
-    await query.edit_message_text("نام جدید را ارسال کنید:\n(برای لغو /cancel)")
+    await query.edit_message_text("✏️ نام جدید را ارسال کنید:\n(برای لغو /cancel)")
     return RENAME_BTN
 
 
@@ -480,7 +598,7 @@ async def prompt_add_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     button_id = int(query.data.split("_")[1])
     context.user_data["upload_button_id"] = button_id
-    await query.edit_message_text("فایل (عکس یا سند) را ارسال کنید:\n(برای لغو /cancel)")
+    await query.edit_message_text("📤 فایل (عکس یا سند) را ارسال کنید:\n(برای لغو /cancel)")
     return UPLOAD_FILE
 
 
@@ -528,7 +646,7 @@ async def prompt_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     button_id = int(query.data.split("_")[1])
     context.user_data["text_button_id"] = button_id
     await query.edit_message_text(
-        "متن/توضیحات را ارسال کنید (می‌تواند چند جمله یا چند خط باشد).\n"
+        "📝 متن/توضیحات را ارسال کنید (می‌تواند چند جمله یا چند خط باشد).\n"
         "این متن هنگام ورود کاربر به این بخش نمایش داده می‌شود.\n"
         "(برای لغو /cancel)"
     )
@@ -553,7 +671,7 @@ async def prompt_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     current = db.get_setting("contact_text", "تنظیم نشده")
-    await query.edit_message_text(f"متن فعلی:\n\n{current}\n\nمتن جدید را ارسال کنید:\n(برای لغو /cancel)")
+    await query.edit_message_text(f"📞 متن فعلی:\n\n{current}\n\nمتن جدید را ارسال کنید:\n(برای لغو /cancel)")
     return SET_CONTACT
 
 
@@ -568,7 +686,7 @@ async def prompt_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     current = db.get_setting("welcome_text", WELCOME_TEXT_DEFAULT)
     await query.edit_message_text(
-        "پیام خوش‌آمدگویی فعلی (که با دستور /start نمایش داده می‌شود):\n\n"
+        "👋 پیام خوش‌آمدگویی فعلی (نمایش داده‌شده با /start):\n\n"
         f"{current}\n\n"
         "متن جدید را ارسال کنید.\n"
         "نکته: اگر از {name} در متن استفاده کنید، با نام کوچک کاربر جایگزین می‌شود.\n"
@@ -584,17 +702,16 @@ async def set_welcome_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SET_WELCOME
 
     db.set_setting("welcome_text", new_text)
-
     preview = new_text.replace("{name}", update.effective_user.first_name or "")
     await update.message.reply_text("✅ پیام خوش‌آمدگویی بروزرسانی شد.\n\nپیش‌نمایش:\n\n" + preview)
-    await update.message.reply_text("🔧 پنل مدیریت", reply_markup=admin_home_kb())
+    await update.message.reply_text(admin_home_text(), reply_markup=admin_home_kb(), parse_mode="HTML")
     return ConversationHandler.END
 
 
 async def prompt_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("پیام همگانی را ارسال کنید (متن/عکس/فایل):\n(برای لغو /cancel)")
+    await query.edit_message_text("📢 پیام همگانی را ارسال کنید (متن/عکس/فایل):\n(برای لغو /cancel)")
     return BROADCAST
 
 
@@ -616,7 +733,7 @@ async def prompt_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "⚠️ فایل بکاپ دیتابیس (.db) را به صورت Document ارسال کنید. دیتابیس فعلی جایگزین خواهد شد.\n"
+        "♻️ فایل بکاپ دیتابیس (.db) را به صورت Document ارسال کنید. دیتابیس فعلی جایگزین خواهد شد.\n"
         "(برای لغو /cancel)"
     )
     return RESTORE_DB
@@ -738,9 +855,18 @@ def main():
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
 
+    # admin inline-panel callbacks
     app.add_handler(CallbackQueryHandler(
         admin_cb_dispatch,
-        pattern=r"^(admhome|admstats|admbackup|admresetmenu|admresetmenuyes|admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|admdelbtn_|admdelbtnyes_|noop)"
+        pattern=r"^(admhome|admtoggleglass|admstats|admbackup|admresetmenu|admresetmenuyes|"
+                r"admtree_|admmoveup_|admmovedown_|admfiles_|admdelfile_|admdelfileyes_|"
+                r"admdelbtn_|admdelbtnyes_|noop)"
+    ))
+
+    # user-facing glass/inline menu callbacks
+    app.add_handler(CallbackQueryHandler(
+        user_cb_dispatch,
+        pattern=r"^(ucat_\d+|uhome|ucontact)$"
     ))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
