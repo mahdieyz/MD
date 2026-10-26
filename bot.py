@@ -3,6 +3,9 @@ import logging
 import html
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -1163,7 +1166,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Startup: command list + menu button (the fix)
+# Startup: command list + menu button
 # ---------------------------------------------------------------------------
 async def post_init(application: Application):
     commands = [
