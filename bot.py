@@ -1125,15 +1125,32 @@ async def restore_db_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     tmp_path = os.path.join(os.path.dirname(DB_PATH) or ".", "restore_tmp.db")
     await file.download_to_drive(tmp_path)
 
+    size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else -1
+    try:
+        with open(tmp_path, "rb") as f:
+            header = f.read(16)
+    except Exception:
+        header = b""
+
+    logger.info(
+        "RESTORE DEBUG: size=%s header=%r file_id=%s file_name=%s file_size=%s",
+        size, header, document.file_id, document.file_name, document.file_size,
+    )
+
     try:
         db.restore_from_file(tmp_path)
         log_admin_activity(update, "بازیابی دیتابیس")
         await reply_text(update, context, "✅ دیتابیس با موفقیت بازیابی شد.", reply_markup=admin_home_kb())
-    except Exception as e:
-        await reply_text(update, context, f"❌ خطا در بازیابی: {e}")
-    finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+    except Exception as e:
+        await reply_text(
+            update, context,
+            f"❌ خطا در بازیابی: {e}\n(debug: size={size}, header={header!r}, tg_file_size={document.file_size})",
+        )
+        # NOTE: tmp_path is intentionally kept on disk for manual inspection when restore fails.
+        # Inspect it at: {tmp_path}
+        # Remember to delete it manually once done debugging.
 
     return ConversationHandler.END
 
