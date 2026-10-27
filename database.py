@@ -165,26 +165,13 @@ class Database:
         self.legacy_map = {}
         with self.conn() as conn:
             cur = conn.cursor()
-            self._walk_existing_tree(cur, 0, DEFAULT_TREE)
-
-    def _walk_existing_tree(self, cur, parent_id, nodes):
-        cur.execute(
-            "SELECT * FROM menu_buttons WHERE parent_id = ? ORDER BY position, id",
-            (parent_id,),
-        )
-        rows = cur.fetchall()
-        for i, (title, key, children) in enumerate(nodes):
-            if i >= len(rows):
-                break
-            matched = None
-            for r in rows:
-                if r["title"] == title:
-                    matched = r
-                    break
-            if matched is None:
-                matched = rows[i]
-            self.legacy_map[key] = matched["id"]
-            self._walk_existing_tree(cur, matched["id"], children)
+            if self._column_exists(cur, "menu_buttons", "legacy_key"):
+                cur.execute(
+                    "SELECT id, legacy_key FROM menu_buttons "
+                    "WHERE legacy_key IS NOT NULL AND legacy_key != ''"
+                )
+                for row in cur.fetchall():
+                    self.legacy_map[row["legacy_key"]] = row["id"]
 
     def _migrate_legacy_catalogs(self):
         with self.conn() as conn:
